@@ -62,9 +62,26 @@ const store = {
   set(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
 };
 
-let positions = store.get('positions', []);
+let transactions = store.get('transactions', []);
+let tickerMeta = store.get('tickerMeta', {});
+let prices = store.get('prices', {});
 let watchlist = store.get('watchlist', []);
 let apiKey = store.get('apiKey', '');
+
+// Migration ponctuelle depuis l'ancien modèle "positions" (une ligne = une position)
+(function migrate() {
+  if (store.get('migratedToTx', false)) return;
+  const oldPositions = store.get('positions', []);
+  if (oldPositions.length) {
+    oldPositions.forEach(p => {
+      transactions.push({ id: p.id, ticker: p.ticker, type:'buy', qty: p.qty, price: p.pru, date: new Date().toISOString().slice(0,10), });
+      tickerMeta[p.ticker] = { currency: p.currency || 'EUR' };
+      prices[p.ticker] = p.prix;
+    });
+    store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices);
+  }
+  store.set('migratedToTx', true);
+})();
 
 const fmt = (n, d=2) => Number.isFinite(n) ? n.toLocaleString('fr-FR', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
 
@@ -170,80 +187,169 @@ async function fetchSeries(symbol) {
 
 // ---- Portfolio ----
 let usdEurRate = store.get('usdEurRate', null);
-function toEur(p) { return p.currency === 'USD' && usdEurRate ? usdEurRate : 1; }
+function rateFor(ticker) { return (tickerMeta[ticker]?.currency === 'USD' && usdEurRate) ? usdEurRate : 1; }
+function symFor(ticker) { return tickerMeta[ticker]?.currency === 'USD' ? '$' : '€'; }
+
+function txForTicker(ticker) {
+  return transactions.filter(t=>t.ticker===ticker).sort((a,b)=> a.date.localeCompare(b.date) || a.id-b.id);
+}
+function computeAgg(ticker) {
+  let qty=0, pru=0, realized=0;
+  txForTicker(ticker).forEach(tx => {
+    if (tx.type==='buy') { pru = (qty+tx.qty)>0 ? (qty*pru + tx.qty*tx.price)/(qty+tx.qty) : tx.price; qty += tx.qty; }
+    else { realized += (tx.price - pru) * tx.qty; qty = Math.max(0, qty - tx.qty); }
+  });
+  return { qty, pru, realized };
+}
+function allTickers() { return [...new Set(transactions.map(t=>t.ticker))]; }
+
+let expandedTicker = null;
+let tickerScores = {}; // en mémoire uniquement, pas persisté (données live)
+let scoreLoading = {};
+let benchmarkCache = null;
+
+async function calcTickerScore(t) {
+  if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
+  scoreLoading[t] = true; renderPortfolio();
+  try {
+    const series = await fetchSeries(t);
+    await new Promise(r=>setTimeout(r,1200));
+    if (!benchmarkCache) {
+      try { benchmarkCache = await fetchSeries('SPY'); } catch(e) { benchmarkCache = null; }
+      await new Promise(r=>setTimeout(r,1200));
+    }
+    const per = tickerMeta[t]?.per ? parseFloat(tickerMeta[t].per) : null;
+    tickerScores[t] = computeScore(series, { per, benchmarkArr: benchmarkCache });
+  } catch (e) {
+    tickerScores[t] = { error: e.message };
+  }
+  scoreLoading[t] = false;
+  renderPortfolio();
+}
+window.calcTickerScore = calcTickerScore;
+window.setTickerPer = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), per: val }; store.set('tickerMeta', tickerMeta); };
 
 function renderPortfolio(status) {
   const el = document.getElementById('tab-portfolio');
-  const hasUsd = positions.some(p=>p.currency==='USD');
-  const totalValue = positions.reduce((a,p)=>a+p.qty*p.prix*toEur(p),0);
-  const totalCost = positions.reduce((a,p)=>a+p.qty*p.pru*toEur(p),0);
-  const pnl = totalValue-totalCost, pnlPct = totalCost ? pnl/totalCost*100 : 0;
+  const tickers = allTickers();
+  const hasUsd = tickers.some(t=>tickerMeta[t]?.currency==='USD');
+  let totalValue=0, totalCostBasis=0, totalRealized=0;
+  const aggs = {};
+  tickers.forEach(t => {
+    const agg = computeAgg(t); aggs[t]=agg;
+    const rate = rateFor(t); const price = prices[t] ?? agg.pru;
+    totalValue += agg.qty*price*rate;
+    totalCostBasis += agg.qty*agg.pru*rate;
+    totalRealized += agg.realized*rate;
+  });
+  const unrealized = totalValue-totalCostBasis;
+  const unrealizedPct = totalCostBasis ? unrealized/totalCostBasis*100 : 0;
+  const totalPnl = unrealized+totalRealized;
+
   el.innerHTML = `
     <div class="card muted">
       <div class="row"><span class="muted-text">Valeur totale</span><span style="font-weight:600;font-size:18px">${fmt(totalValue)} €</span></div>
-      <div class="row"><span class="muted-text">P&L latent</span><span class="${pnl>=0?'green':'red'}" style="font-weight:600">${fmt(pnl)} € (${fmt(pnlPct)}%)</span></div>
+      <div class="row"><span class="muted-text">P&L latent</span><span class="${unrealized>=0?'green':'red'}" style="font-weight:600">${fmt(unrealized)} € (${fmt(unrealizedPct)}%)</span></div>
+      <div class="row"><span class="muted-text">Gains réalisés (cumulés)</span><span class="${totalRealized>=0?'green':'red'}" style="font-weight:600">${fmt(totalRealized)} €</span></div>
+      <div class="row" style="margin-top:4px;border-top:0.5px solid var(--border);padding-top:4px"><span class="muted-text">P&L total</span><span class="${totalPnl>=0?'green':'red'}" style="font-weight:700">${fmt(totalPnl)} €</span></div>
       ${hasUsd ? `<div class="muted-text" style="margin-top:4px">Taux USD→EUR : ${usdEurRate ? fmt(usdEurRate,4) : 'inconnu — actualisez les prix'}</div>` : ''}
     </div>
-    ${positions.length ? `<button onclick="refreshPrices()" ${status==='loading'?'disabled':''}>${status==='loading' ? 'Actualisation…' : '↻ Actualiser les prix'}</button>` : ''}
+    ${tickers.length ? `<button onclick="refreshPrices()" ${status==='loading'?'disabled':''}>${status==='loading' ? 'Actualisation…' : '↻ Actualiser les prix'}</button>` : ''}
     ${status && status!=='loading' ? `<div class="muted-text" style="margin:-4px 0 8px">${status}</div>` : ''}
-    ${positions.length>3 ? `<div class="muted-text" style="margin:-4px 0 8px">Plan gratuit Twelve Data : ~8 requêtes/minute, l'actualisation de plusieurs positions peut prendre du temps.</div>` : ''}
-    ${positions.map(p => {
-      const sym = p.currency==='USD' ? '$' : '€';
-      const pn = (p.prix-p.pru)*p.qty, pnp = p.pru ? (p.prix-p.pru)/p.pru*100 : 0;
+    ${tickers.length>3 ? `<div class="muted-text" style="margin:-4px 0 8px">Plan gratuit Twelve Data : ~8 requêtes/minute, l'actualisation peut prendre du temps.</div>` : ''}
+    ${tickers.map(t => {
+      const agg = aggs[t]; const sym = symFor(t); const price = prices[t] ?? agg.pru;
+      const unrl = (price-agg.pru)*agg.qty; const unrlPct = agg.pru ? (price-agg.pru)/agg.pru*100 : 0;
+      const isOpen = expandedTicker === t;
       return `<div class="card">
         <div class="row">
-          <div><div style="font-weight:600">${p.ticker}</div><div class="muted-text">${p.qty} × ${fmt(p.pru)} ${sym} PRU</div></div>
-          <button class="del" onclick="removePosition(${p.id})">✕</button>
+          <div><div style="font-weight:600">${t}</div><div class="muted-text">${fmt(agg.qty,4)} × ${fmt(agg.pru)} ${sym} PRU moyen</div></div>
+          <button class="del" onclick="removeTicker('${t}')">✕</button>
         </div>
         <div class="row" style="margin-top:8px">
           <div style="display:flex;align-items:center;gap:6px">
             <span class="muted-text">Prix</span>
-            <input style="width:64px;margin:0" value="${p.prix}" onchange="updatePrice(${p.id}, this.value)"/>
-            <select style="width:64px;margin:0;padding:8px 4px" onchange="updateCurrency(${p.id}, this.value)">
-              <option value="EUR" ${p.currency==='EUR'?'selected':''}>EUR</option>
-              <option value="USD" ${p.currency==='USD'?'selected':''}>USD</option>
+            <input style="width:64px;margin:0" value="${price}" onchange="updateTickerPrice('${t}', this.value)"/>
+            <select style="width:64px;margin:0;padding:8px 4px" onchange="updateTickerCurrency('${t}', this.value)">
+              <option value="EUR" ${sym==='€'?'selected':''}>EUR</option>
+              <option value="USD" ${sym==='$'?'selected':''}>USD</option>
             </select>
           </div>
-          <span class="${pn>=0?'green':'red'}" style="font-weight:600">${fmt(pn)} ${sym} (${fmt(pnp)}%)</span>
+          <span class="${unrl>=0?'green':'red'}" style="font-weight:600">${fmt(unrl)} ${sym} (${fmt(unrlPct)}%)</span>
         </div>
+        ${agg.realized ? `<div class="muted-text" style="margin-top:4px">Réalisé : ${fmt(agg.realized)} ${sym}</div>` : ''}
+        <div class="row" style="margin-top:8px;gap:6px">
+          <input placeholder="PER (optionnel)" style="margin:0" value="${tickerMeta[t]?.per||''}" onchange="setTickerPer('${t}', this.value)"/>
+          <button style="width:auto;white-space:nowrap;margin:0" onclick="calcTickerScore('${t}')" ${scoreLoading[t]?'disabled':''}>${scoreLoading[t]?'…':(tickerScores[t]&&!tickerScores[t].error?'↻ Score':'Calculer le score')}</button>
+        </div>
+        ${tickerScores[t] ? (tickerScores[t].error
+          ? `<div class="red" style="font-size:12px;margin-top:4px">${tickerScores[t].error}</div>`
+          : `<div class="row" style="margin-top:8px;align-items:center">
+               <span class="muted-text" style="font-size:12px">Score technique</span>
+               <span style="font-weight:700;font-size:18px;color:${tickerScores[t].total>=60?'#0f6e56':tickerScores[t].total>=40?'#b8860b':'#a32d2d'}">${tickerScores[t].total}/100</span>
+             </div>`) : ''}
+        <button style="margin-top:8px" onclick="toggleTicker('${t}')">${isOpen?'▲ Masquer les transactions':'▼ Voir les transactions ('+txForTicker(t).length+')'}</button>
+        ${isOpen ? txForTicker(t).map(tx => `
+          <div class="row" style="font-size:12px;padding:4px 0;border-top:0.5px solid var(--border)">
+            <span>${tx.date} · ${tx.type==='buy'?'Achat':'Vente'} ${fmt(tx.qty,4)} @ ${fmt(tx.price)} ${sym}</span>
+            <button class="del" style="font-size:14px" onclick="removeTransaction(${tx.id})">✕</button>
+          </div>`).join('') : ''}
       </div>`;
     }).join('')}
     <div class="card">
-      <div style="font-weight:600;margin-bottom:8px">Ajouter une position</div>
+      <div style="font-weight:600;margin-bottom:8px">Ajouter une transaction</div>
       <div class="grid2">
         <input id="p-ticker" list="ticker-suggestions" placeholder="Ticker"/>
+        <select id="p-type"><option value="buy">Achat</option><option value="sell">Vente</option></select>
         <input id="p-qty" placeholder="Quantité"/>
-        <input id="p-pru" placeholder="Prix d'achat"/>
-        <input id="p-prix" placeholder="Prix actuel (opt.)"/>
+        <input id="p-price" placeholder="Prix"/>
       </div>
-      <select id="p-currency" style="margin-bottom:8px">
+      <input id="p-date" type="date" value="${new Date().toISOString().slice(0,10)}"/>
+      <select id="p-currency">
         <option value="EUR">EUR</option>
         <option value="USD">USD</option>
       </select>
-      <button onclick="addPosition()">+ Ajouter</button>
+      <button onclick="addTransaction()">+ Ajouter la transaction</button>
     </div>`;
   attachAutocomplete(['p-ticker']);
 }
-window.addPosition = () => {
-  const t = document.getElementById('p-ticker').value, q = document.getElementById('p-qty').value, pr = document.getElementById('p-pru').value, px = document.getElementById('p-prix').value;
+window.toggleTicker = (t) => { expandedTicker = expandedTicker===t ? null : t; renderPortfolio(); };
+window.addTransaction = () => {
+  const t = document.getElementById('p-ticker').value.trim().toUpperCase();
+  const type = document.getElementById('p-type').value;
+  const q = document.getElementById('p-qty').value;
+  const pr = document.getElementById('p-price').value;
+  const date = document.getElementById('p-date').value;
   const cur = document.getElementById('p-currency').value;
-  if (!t||!q||!pr) return;
-  positions.push({id:Date.now(), ticker:t.toUpperCase(), qty:parseFloat(q.replace(',','.')), pru:parseFloat(pr.replace(',','.')), prix: px?parseFloat(px.replace(',','.')):parseFloat(pr.replace(',','.')), currency: cur});
-  store.set('positions', positions); renderPortfolio();
+  if (!t||!q||!pr||!date) return;
+  const qty = parseFloat(q.replace(',','.')), price = parseFloat(pr.replace(',','.'));
+  if (type==='sell') {
+    const agg = computeAgg(t);
+    if (qty > agg.qty + 1e-9) { alert(`Vous ne détenez que ${fmt(agg.qty,4)} ${t}, impossible de vendre ${fmt(qty,4)}.`); return; }
+  }
+  transactions.push({ id: Date.now(), ticker:t, type, qty, price, date });
+  if (!tickerMeta[t]) tickerMeta[t] = { currency: cur };
+  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta);
+  document.getElementById('p-ticker').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
+  renderPortfolio();
 };
-window.removePosition = (id) => {
-  const p = positions.find(x=>x.id===id);
-  if (!confirm(`Supprimer la position ${p ? p.ticker : ''} ?`)) return;
-  positions = positions.filter(p=>p.id!==id); store.set('positions', positions); renderPortfolio();
+window.removeTransaction = (id) => {
+  if (!confirm('Supprimer cette transaction ? Le PRU et le P&L seront recalculés.')) return;
+  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); renderPortfolio();
 };
-window.updatePrice = (id, val) => { positions = positions.map(p=>p.id===id?{...p, prix: parseFloat(val.replace(',','.'))||p.prix}:p); store.set('positions', positions); renderPortfolio(); };
-window.updateCurrency = (id, val) => { positions = positions.map(p=>p.id===id?{...p, currency: val}:p); store.set('positions', positions); renderPortfolio(); };
+window.removeTicker = (t) => {
+  if (!confirm(`Supprimer TOUTES les transactions ${t} ?`)) return;
+  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); renderPortfolio();
+};
+window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); renderPortfolio(); };
+window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); renderPortfolio(); };
 window.refreshPrices = async () => {
   if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
   renderPortfolio('loading');
   const delay = (ms) => new Promise(r=>setTimeout(r,ms));
+  const tickers = allTickers();
   let failed = [];
-  if (positions.some(p=>p.currency==='USD')) {
+  if (tickers.some(t=>tickerMeta[t]?.currency==='USD')) {
     try {
       const res = await fetch(`https://api.twelvedata.com/exchange_rate?symbol=USD/EUR&apikey=${apiKey}`);
       const data = await res.json();
@@ -253,15 +359,15 @@ window.refreshPrices = async () => {
     } catch(e) { failed.push('taux USD→EUR'); }
     await delay(1200);
   }
-  for (const p of positions) {
+  for (const t of tickers) {
     try {
-      const q = await fetchQuote(p.ticker);
+      const q = await fetchQuote(t);
       const price = parseFloat(q.close);
-      if (Number.isFinite(price)) positions = positions.map(x=>x.id===p.id?{...x, prix:price}:x);
-    } catch (e) { failed.push(p.ticker); }
+      if (Number.isFinite(price)) prices[t] = price;
+    } catch (e) { failed.push(t); }
     await delay(1200);
   }
-  store.set('positions', positions);
+  store.set('prices', prices);
   renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.');
 };
 
