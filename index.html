@@ -43,7 +43,7 @@
 <div class="wrap">
   <h2 id="sr-title">Outil d'aide à l'investissement : portfolio, analyse d'action et watchlist</h2>
   <div class="tabs">
-    <button class="tab active" data-tab="portfolio">Portfolio</button>
+    <button class="tab" data-tab="portfolio">Portfolio</button>
     <button class="tab" data-tab="analyse">Analyse</button>
     <button class="tab" data-tab="watch">Watchlist</button>
     <button class="tab" data-tab="config">Clé API</button>
@@ -53,6 +53,7 @@
   <div id="tab-analyse" style="display:none"></div>
   <div id="tab-watch" style="display:none"></div>
   <div id="tab-config" style="display:none"></div>
+  <datalist id="ticker-suggestions"></datalist>
 </div>
 
 <script>
@@ -75,31 +76,82 @@ function rsi(arr, p=14) { if (arr.length < p+1) return null; const ch = arr.slic
   if (l===0) return 100; return 100 - 100/(1+g/l); }
 function macd(arr) { if (arr.length<26) return null; const e12=ema(arr,12), e26=ema(arr,26);
   const line=e12.map((v,i)=>v-e26[i]); const sig=ema(line.slice(-Math.max(line.length-25,9)),9);
-  return { macd: line[line.length-1], signal: sig[sig.length-1], hist: line[line.length-1]-sig[sig.length-1] }; }
+  const histSeries = sig.map((v,i)=> line[line.length-sig.length+i] - v).slice(-5);
+  return { macd: line[line.length-1], signal: sig[sig.length-1], hist: histSeries[histSeries.length-1], histSeries }; }
 function volat(arr) { if (arr.length<2) return null; const r = arr.slice(1).map((v,i)=>(v-arr[i])/arr[i]);
   const m = r.reduce((a,b)=>a+b,0)/r.length; const v = r.reduce((a,b)=>a+(b-m)**2,0)/r.length;
   return Math.sqrt(v)*Math.sqrt(252)*100; }
 function momentum(arr, p=20) { if (arr.length<p+1) return null; const past=arr[arr.length-1-p], last=arr[arr.length-1]; return (last-past)/past*100; }
 
-function computeScore(arr) {
+function perScore(per) {
+  if (per===null || !Number.isFinite(per) || per<=0) return 7.5; // neutre si absent
+  if (per < 15) return 15;
+  if (per < 20) return 12;
+  if (per < 25) return 9;
+  if (per < 35) return 5;
+  return 2;
+}
+
+function computeScore(arr, opts={}) {
+  const { per=null, benchmarkArr=null } = opts;
   const last=arr[arr.length-1], s20=sma(arr,20), s50=sma(arr,50), r=rsi(arr,14), m=macd(arr), vol=volat(arr), mom=momentum(arr,20);
   let trend=0;
-  if (s20 && s50) { if (last>s20 && s20>s50) trend=25; else if (last>s20||last>s50) trend=15; else if (last<s20&&s20<s50) trend=0; else trend=8; }
-  else if (s20) trend = last>s20 ? 18 : 5;
-  let rsiS=10;
-  if (r!==null) { if (r>=45&&r<=65) rsiS=20; else if (r>65&&r<=75) rsiS=13; else if (r>=30&&r<45) rsiS=15; else if (r>75) rsiS=5; else rsiS=6; }
-  let macdS=10;
-  if (m) { if (m.hist>0&&m.macd>0) macdS=20; else if (m.hist>0) macdS=14; else if (m.hist<0&&m.macd<0) macdS=3; else macdS=8; }
-  let momS = mom!==null ? Math.max(0,Math.min(20,10+mom/2)) : 10;
-  let volS = vol!==null ? Math.max(0,Math.min(15,15-vol/5)) : 8;
-  const total = Math.max(0,Math.min(100, Math.round(trend+rsiS+macdS+momS+volS)));
+  if (s20 && s50) { if (last>s20 && s20>s50) trend=20; else if (last>s20||last>s50) trend=12; else if (last<s20&&s20<s50) trend=0; else trend=6; }
+  else if (s20) trend = last>s20 ? 14 : 4;
+  let rsiS=8;
+  if (r!==null) { if (r>=45&&r<=65) rsiS=15; else if (r>65&&r<=75) rsiS=10; else if (r>=30&&r<45) rsiS=11; else if (r>75) rsiS=4; else rsiS=5; }
+  let macdS=8, macdTrend=0;
+  if (m) {
+    if (m.hist>0&&m.macd>0) macdS=12; else if (m.hist>0) macdS=8; else if (m.hist<0&&m.macd<0) macdS=2; else macdS=5;
+    if (m.histSeries && m.histSeries.length>=2) {
+      macdTrend = m.histSeries[m.histSeries.length-1] - m.histSeries[0];
+      macdS += macdTrend > 0 ? 3 : macdTrend < 0 ? -3 : 0;
+      macdS = Math.max(0, Math.min(15, macdS));
+    }
+  }
+  let momS = mom!==null ? Math.max(0,Math.min(15,7.5+mom*0.375)) : 7.5;
+  let volS = vol!==null ? Math.max(0,Math.min(10,10-vol/6)) : 5;
+  const perS = perScore(per);
+  let relS = 5; // neutre si pas de benchmark
+  let relMom = null;
+  if (benchmarkArr && benchmarkArr.length>20) {
+    const benchMom = momentum(benchmarkArr,20);
+    if (mom!==null && benchMom!==null) {
+      relMom = mom - benchMom;
+      relS = Math.max(0, Math.min(10, 5 + relMom*0.3));
+    }
+  }
+  const total = Math.max(0,Math.min(100, Math.round(trend+rsiS+macdS+momS+volS+perS+relS)));
   return { total, breakdown:[
-    {label:'Tendance (prix vs SMA20/50)', value:trend, max:25},
-    {label:'RSI (14)', value:Math.round(rsiS), max:20},
-    {label:'MACD', value:Math.round(macdS), max:20},
-    {label:'Momentum (20 périodes)', value:Math.round(momS), max:20},
-    {label:'Volatilité (stabilité)', value:Math.round(volS), max:15},
-  ], raw:{last,s20,s50,r,m,vol,mom} };
+    {label:'Tendance (prix vs SMA20/50)', value:Math.round(trend), max:20},
+    {label:'RSI (14)', value:Math.round(rsiS), max:15},
+    {label:'MACD', value:Math.round(macdS), max:15},
+    {label:'Momentum (20 périodes)', value:Math.round(momS), max:15},
+    {label:'Volatilité (stabilité)', value:Math.round(volS), max:10},
+    {label:'PER', value:Math.round(perS), max:15},
+    {label:'Performance vs indice', value:Math.round(relS), max:10},
+  ], raw:{last,s20,s50,r,m,vol,mom,per,relMom,macdTrend} };
+}
+
+async function searchSymbols(q) {
+  if (!apiKey || q.length<2) return;
+  try {
+    const res = await fetch(`https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(q)}&apikey=${apiKey}`);
+    const data = await res.json();
+    const dl = document.getElementById('ticker-suggestions');
+    dl.innerHTML = (data.data||[]).slice(0,8).map(s => `<option value="${s.symbol}">${s.instrument_name||''}</option>`).join('');
+  } catch(e) { /* pas de suggestion, tant pis */ }
+}
+let searchTimer = null;
+function debouncedSearch(val) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => searchSymbols(val), 400);
+}
+function attachAutocomplete(ids) {
+  ids.forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener('input', (e) => debouncedSearch(e.target.value));
+  });
 }
 
 // ---- API Twelve Data ----
@@ -110,14 +162,14 @@ async function fetchQuote(symbol) {
   return data;
 }
 async function fetchSeries(symbol) {
-  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=90&apikey=${apiKey}`);
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=250&apikey=${apiKey}`);
   const data = await res.json();
   if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
   return data.values.map(v => parseFloat(v.close)).reverse();
 }
 
 // ---- Portfolio ----
-function renderPortfolio() {
+function renderPortfolio(status) {
   const el = document.getElementById('tab-portfolio');
   const totalValue = positions.reduce((a,p)=>a+p.qty*p.prix,0);
   const totalCost = positions.reduce((a,p)=>a+p.qty*p.pru,0);
@@ -127,6 +179,9 @@ function renderPortfolio() {
       <div class="row"><span class="muted-text">Valeur totale</span><span style="font-weight:600;font-size:18px">${fmt(totalValue)} €</span></div>
       <div class="row"><span class="muted-text">P&L latent</span><span class="${pnl>=0?'green':'red'}" style="font-weight:600">${fmt(pnl)} € (${fmt(pnlPct)}%)</span></div>
     </div>
+    ${positions.length ? `<button onclick="refreshPrices()" ${status==='loading'?'disabled':''}>${status==='loading' ? 'Actualisation…' : '↻ Actualiser les prix'}</button>` : ''}
+    ${status && status!=='loading' ? `<div class="muted-text" style="margin:-4px 0 8px">${status}</div>` : ''}
+    ${positions.length>3 ? `<div class="muted-text" style="margin:-4px 0 8px">Plan gratuit Twelve Data : ~8 requêtes/minute, l'actualisation de plusieurs positions peut prendre du temps.</div>` : ''}
     ${positions.map(p => {
       const pn = (p.prix-p.pru)*p.qty, pnp = p.pru ? (p.prix-p.pru)/p.pru*100 : 0;
       return `<div class="card">
@@ -144,13 +199,14 @@ function renderPortfolio() {
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">Ajouter une position</div>
       <div class="grid2">
-        <input id="p-ticker" placeholder="Ticker"/>
+        <input id="p-ticker" list="ticker-suggestions" placeholder="Ticker"/>
         <input id="p-qty" placeholder="Quantité"/>
         <input id="p-pru" placeholder="Prix d'achat"/>
         <input id="p-prix" placeholder="Prix actuel (opt.)"/>
       </div>
       <button onclick="addPosition()">+ Ajouter</button>
     </div>`;
+  attachAutocomplete(['p-ticker']);
 }
 window.addPosition = () => {
   const t = document.getElementById('p-ticker').value, q = document.getElementById('p-qty').value, pr = document.getElementById('p-pru').value, px = document.getElementById('p-prix').value;
@@ -158,8 +214,28 @@ window.addPosition = () => {
   positions.push({id:Date.now(), ticker:t.toUpperCase(), qty:parseFloat(q.replace(',','.')), pru:parseFloat(pr.replace(',','.')), prix: px?parseFloat(px.replace(',','.')):parseFloat(pr.replace(',','.'))});
   store.set('positions', positions); renderPortfolio();
 };
-window.removePosition = (id) => { positions = positions.filter(p=>p.id!==id); store.set('positions', positions); renderPortfolio(); };
+window.removePosition = (id) => {
+  const p = positions.find(x=>x.id===id);
+  if (!confirm(`Supprimer la position ${p ? p.ticker : ''} ?`)) return;
+  positions = positions.filter(p=>p.id!==id); store.set('positions', positions); renderPortfolio();
+};
 window.updatePrice = (id, val) => { positions = positions.map(p=>p.id===id?{...p, prix: parseFloat(val.replace(',','.'))||p.prix}:p); store.set('positions', positions); renderPortfolio(); };
+window.refreshPrices = async () => {
+  if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
+  renderPortfolio('loading');
+  const delay = (ms) => new Promise(r=>setTimeout(r,ms));
+  let failed = [];
+  for (const p of positions) {
+    try {
+      const q = await fetchQuote(p.ticker);
+      const price = parseFloat(q.close);
+      if (Number.isFinite(price)) positions = positions.map(x=>x.id===p.id?{...x, prix:price}:x);
+    } catch (e) { failed.push(p.ticker); }
+    await delay(1200);
+  }
+  store.set('positions', positions);
+  renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.');
+};
 
 // ---- Analyse ----
 function renderAnalyse(result, error, loading) {
@@ -167,7 +243,9 @@ function renderAnalyse(result, error, loading) {
   el.innerHTML = `
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">Analyse en direct</div>
-      <input id="a-ticker" placeholder="Ticker (ex: AAPL, MC.PA)" />
+      <input id="a-ticker" list="ticker-suggestions" placeholder="Ticker (ex: AAPL, MC.PA)" value="${store.get('lastTicker','')}" />
+      <input id="a-per" placeholder="PER (optionnel, sinon neutre)" value="${store.get('lastPer','')}" />
+      <input id="a-bench" list="ticker-suggestions" placeholder="Indice de référence (défaut: SPY)" value="${store.get('lastBench','')}" />
       <button onclick="runLive()">${loading ? 'Chargement…' : '↻ Analyser (données en direct)'}</button>
       ${error ? `<div class="red" style="font-size:12px">${error}</div>` : ''}
       ${!apiKey ? `<div class="muted-text">Ajoutez votre clé API Twelve Data dans l'onglet "Clé API".</div>` : ''}
@@ -189,21 +267,31 @@ function renderAnalyse(result, error, loading) {
         <div>Dernier cours : ${fmt(result.raw.last)}</div>
         <div>SMA20 : ${fmt(result.raw.s20)} · SMA50 : ${fmt(result.raw.s50)}</div>
         <div>RSI(14) : ${result.raw.r!==null?fmt(result.raw.r,1):'—'}</div>
-        <div>MACD hist. : ${result.raw.m?fmt(result.raw.m.hist,3):'—'}</div>
+        <div>MACD hist. : ${result.raw.m?fmt(result.raw.m.hist,3):'—'} ${result.raw.macdTrend ? (result.raw.macdTrend>0?'↗ en hausse (5 séances)':'↘ en baisse (5 séances)') : ''}</div>
         <div>Momentum 20p : ${result.raw.mom!==null?fmt(result.raw.mom,1)+'%':'—'}</div>
         <div>Volatilité annualisée : ${result.raw.vol!==null?fmt(result.raw.vol,1)+'%':'—'}</div>
+        <div>PER utilisé : ${result.raw.per!==null?fmt(result.raw.per,1):'— (neutre)'}</div>
+        <div>Perf. relative vs indice (20p) : ${result.raw.relMom!==null?fmt(result.raw.relMom,1)+' pts':'— (neutre)'}</div>
       </div>` : ''}`;
+  attachAutocomplete(['a-ticker','a-bench']);
 }
 let lastResult = null;
 window.runLive = async () => {
   const ticker = document.getElementById('a-ticker').value.trim();
+  const perInput = document.getElementById('a-per').value.trim();
+  const bench = document.getElementById('a-bench').value.trim() || 'SPY';
   if (!ticker) return;
+  store.set('lastTicker', ticker); store.set('lastPer', perInput); store.set('lastBench', document.getElementById('a-bench').value.trim());
   if (!apiKey) { renderAnalyse(null, 'Ajoutez d\'abord une clé API dans l\'onglet dédié.', false); return; }
   renderAnalyse(null, '', true);
   try {
     const series = await fetchSeries(ticker);
     if (series.length < 15) throw new Error('Pas assez de données renvoyées par l\'API.');
-    const score = computeScore(series);
+    await new Promise(r=>setTimeout(r,1200));
+    let benchSeries = null;
+    try { benchSeries = await fetchSeries(bench); } catch(e) { /* comparaison indisponible, on reste neutre */ }
+    const per = perInput ? parseFloat(perInput.replace(',','.')) : null;
+    const score = computeScore(series, { per, benchmarkArr: benchSeries });
     lastResult = { ...score, ticker };
     renderAnalyse(lastResult, '', false);
   } catch (e) {
@@ -218,7 +306,7 @@ function renderWatch() {
   el.innerHTML = `
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">Ajouter à la watchlist</div>
-      <input id="w-ticker" placeholder="Ticker"/>
+      <input id="w-ticker" list="ticker-suggestions" placeholder="Ticker"/>
       <input id="w-theme" placeholder="Thème / secteur"/>
       <input id="w-note" placeholder="Note"/>
       <button onclick="addWatch()">+ Ajouter</button>
@@ -233,6 +321,7 @@ function renderWatch() {
             <button class="del" onclick="removeWatch(${w.id})">✕</button>
           </div>`).join('')}
       </div>`).join('')}`;
+  attachAutocomplete(['w-ticker']);
 }
 window.addWatch = () => {
   const t = document.getElementById('w-ticker').value, th = document.getElementById('w-theme').value, n = document.getElementById('w-note').value;
@@ -240,7 +329,11 @@ window.addWatch = () => {
   watchlist.push({id:Date.now(), ticker:t.toUpperCase(), theme: th||'Non classé', note:n});
   store.set('watchlist', watchlist); renderWatch();
 };
-window.removeWatch = (id) => { watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); renderWatch(); };
+window.removeWatch = (id) => {
+  const w = watchlist.find(x=>x.id===id);
+  if (!confirm(`Retirer ${w ? w.ticker : 'cet élément'} de la watchlist ?`)) return;
+  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); renderWatch();
+};
 
 // ---- Config ----
 function renderConfig() {
@@ -260,11 +353,19 @@ document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
+    store.set('lastTab', btn.dataset.tab);
     ['portfolio','analyse','watch','config'].forEach(t => document.getElementById('tab-'+t).style.display = t===btn.dataset.tab ? 'block':'none');
   });
 });
 
 renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
+
+const initialTab = store.get('lastTab', 'portfolio');
+document.querySelectorAll('.tab').forEach(b => {
+  const isActive = b.dataset.tab === initialTab;
+  b.classList.toggle('active', isActive);
+  document.getElementById('tab-'+b.dataset.tab).style.display = isActive ? 'block' : 'none';
+});
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(()=>{});
