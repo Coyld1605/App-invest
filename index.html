@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Investissement</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Investissement" />
+<style>
+  :root {
+    --bg: #f5f5f4; --card: #ffffff; --border: #e5e5e5;
+    --text: #111111; --text-2: #666666; --accent: #378ADD;
+    --green: #0f6e56; --red: #a32d2d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1c1a; --card: #262624; --border: #3a3a38; --text: #f0f0ee; --text-2: #a0a09a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,system-ui,sans-serif; padding-bottom:2rem; }
+  .wrap { max-width:480px; margin:0 auto; padding:1rem; }
+  .tabs { display:flex; gap:8px; margin-bottom:1rem; position:sticky; top:0; background:var(--bg); padding-top:0.5rem; z-index:10; }
+  .tab { flex:1; padding:10px 4px; text-align:center; border:0.5px solid var(--border); border-radius:10px; font-size:12px; background:transparent; color:var(--text-2); cursor:pointer; }
+  .tab.active { background:var(--card); color:var(--text); font-weight:600; }
+  .card { background:var(--card); border:0.5px solid var(--border); border-radius:12px; padding:1rem 1.1rem; margin-bottom:12px; }
+  .card.muted { background:var(--bg); }
+  input, textarea, button { width:100%; font-size:14px; padding:8px 10px; border-radius:8px; border:0.5px solid var(--border); background:var(--bg); color:var(--text); margin-bottom:8px; font-family:inherit; }
+  button { cursor:pointer; font-weight:600; background:var(--card); }
+  button:active { transform:scale(0.98); }
+  .row { display:flex; justify-content:space-between; align-items:center; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .muted-text { color:var(--text-2); font-size:12px; }
+  .green { color:var(--green); } .red { color:var(--red); }
+  .score { font-size:40px; font-weight:700; text-align:center; margin:4px 0; }
+  .bar-bg { height:6px; background:var(--bg); border-radius:3px; margin-top:4px; }
+  .bar-fill { height:6px; background:var(--accent); border-radius:3px; }
+  .del { border:none; background:none; color:var(--red); font-size:18px; padding:0; width:auto; }
+  h2 { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2 id="sr-title">Outil d'aide à l'investissement : portfolio, analyse d'action et watchlist</h2>
+  <div class="tabs">
+    <button class="tab active" data-tab="portfolio">Portfolio</button>
+    <button class="tab" data-tab="analyse">Analyse</button>
+    <button class="tab" data-tab="watch">Watchlist</button>
+    <button class="tab" data-tab="config">Clé API</button>
+  </div>
+
+  <div id="tab-portfolio"></div>
+  <div id="tab-analyse" style="display:none"></div>
+  <div id="tab-watch" style="display:none"></div>
+  <div id="tab-config" style="display:none"></div>
+</div>
+
+<script>
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch(e) { return d; } },
+  set(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
+};
+
+let positions = store.get('positions', []);
+let watchlist = store.get('watchlist', []);
+let apiKey = store.get('apiKey', '');
+
+const fmt = (n, d=2) => Number.isFinite(n) ? n.toLocaleString('fr-FR', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
+
+// ---- indicateurs ----
+function sma(arr, p) { const s = arr.slice(-p); return s.length ? s.reduce((a,b)=>a+b,0)/s.length : null; }
+function ema(arr, p) { if (!arr.length) return []; const k = 2/(p+1); const out=[arr[0]]; for (let i=1;i<arr.length;i++) out.push(arr[i]*k + out[i-1]*(1-k)); return out; }
+function rsi(arr, p=14) { if (arr.length < p+1) return null; const ch = arr.slice(1).map((v,i)=>v-arr[i]).slice(-p);
+  const g = ch.filter(c=>c>0).reduce((a,b)=>a+b,0)/p; const l = -ch.filter(c=>c<0).reduce((a,b)=>a+b,0)/p;
+  if (l===0) return 100; return 100 - 100/(1+g/l); }
+function macd(arr) { if (arr.length<26) return null; const e12=ema(arr,12), e26=ema(arr,26);
+  const line=e12.map((v,i)=>v-e26[i]); const sig=ema(line.slice(-Math.max(line.length-25,9)),9);
+  return { macd: line[line.length-1], signal: sig[sig.length-1], hist: line[line.length-1]-sig[sig.length-1] }; }
+function volat(arr) { if (arr.length<2) return null; const r = arr.slice(1).map((v,i)=>(v-arr[i])/arr[i]);
+  const m = r.reduce((a,b)=>a+b,0)/r.length; const v = r.reduce((a,b)=>a+(b-m)**2,0)/r.length;
+  return Math.sqrt(v)*Math.sqrt(252)*100; }
+function momentum(arr, p=20) { if (arr.length<p+1) return null; const past=arr[arr.length-1-p], last=arr[arr.length-1]; return (last-past)/past*100; }
+
+function computeScore(arr) {
+  const last=arr[arr.length-1], s20=sma(arr,20), s50=sma(arr,50), r=rsi(arr,14), m=macd(arr), vol=volat(arr), mom=momentum(arr,20);
+  let trend=0;
+  if (s20 && s50) { if (last>s20 && s20>s50) trend=25; else if (last>s20||last>s50) trend=15; else if (last<s20&&s20<s50) trend=0; else trend=8; }
+  else if (s20) trend = last>s20 ? 18 : 5;
+  let rsiS=10;
+  if (r!==null) { if (r>=45&&r<=65) rsiS=20; else if (r>65&&r<=75) rsiS=13; else if (r>=30&&r<45) rsiS=15; else if (r>75) rsiS=5; else rsiS=6; }
+  let macdS=10;
+  if (m) { if (m.hist>0&&m.macd>0) macdS=20; else if (m.hist>0) macdS=14; else if (m.hist<0&&m.macd<0) macdS=3; else macdS=8; }
+  let momS = mom!==null ? Math.max(0,Math.min(20,10+mom/2)) : 10;
+  let volS = vol!==null ? Math.max(0,Math.min(15,15-vol/5)) : 8;
+  const total = Math.max(0,Math.min(100, Math.round(trend+rsiS+macdS+momS+volS)));
+  return { total, breakdown:[
+    {label:'Tendance (prix vs SMA20/50)', value:trend, max:25},
+    {label:'RSI (14)', value:Math.round(rsiS), max:20},
+    {label:'MACD', value:Math.round(macdS), max:20},
+    {label:'Momentum (20 périodes)', value:Math.round(momS), max:20},
+    {label:'Volatilité (stabilité)', value:Math.round(volS), max:15},
+  ], raw:{last,s20,s50,r,m,vol,mom} };
+}
+
+// ---- API Twelve Data ----
+async function fetchQuote(symbol) {
+  const res = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`);
+  const data = await res.json();
+  if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
+  return data;
+}
+async function fetchSeries(symbol) {
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=90&apikey=${apiKey}`);
+  const data = await res.json();
+  if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
+  return data.values.map(v => parseFloat(v.close)).reverse();
+}
+
+// ---- Portfolio ----
+function renderPortfolio() {
+  const el = document.getElementById('tab-portfolio');
+  const totalValue = positions.reduce((a,p)=>a+p.qty*p.prix,0);
+  const totalCost = positions.reduce((a,p)=>a+p.qty*p.pru,0);
+  const pnl = totalValue-totalCost, pnlPct = totalCost ? pnl/totalCost*100 : 0;
+  el.innerHTML = `
+    <div class="card muted">
+      <div class="row"><span class="muted-text">Valeur totale</span><span style="font-weight:600;font-size:18px">${fmt(totalValue)} €</span></div>
+      <div class="row"><span class="muted-text">P&L latent</span><span class="${pnl>=0?'green':'red'}" style="font-weight:600">${fmt(pnl)} € (${fmt(pnlPct)}%)</span></div>
+    </div>
+    ${positions.map(p => {
+      const pn = (p.prix-p.pru)*p.qty, pnp = p.pru ? (p.prix-p.pru)/p.pru*100 : 0;
+      return `<div class="card">
+        <div class="row">
+          <div><div style="font-weight:600">${p.ticker}</div><div class="muted-text">${p.qty} × ${fmt(p.pru)} € PRU</div></div>
+          <button class="del" onclick="removePosition(${p.id})">✕</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <div style="display:flex;align-items:center;gap:6px"><span class="muted-text">Prix</span>
+            <input style="width:70px;margin:0" value="${p.prix}" onchange="updatePrice(${p.id}, this.value)"/></div>
+          <span class="${pn>=0?'green':'red'}" style="font-weight:600">${fmt(pn)} € (${fmt(pnp)}%)</span>
+        </div>
+      </div>`;
+    }).join('')}
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Ajouter une position</div>
+      <div class="grid2">
+        <input id="p-ticker" placeholder="Ticker"/>
+        <input id="p-qty" placeholder="Quantité"/>
+        <input id="p-pru" placeholder="Prix d'achat"/>
+        <input id="p-prix" placeholder="Prix actuel (opt.)"/>
+      </div>
+      <button onclick="addPosition()">+ Ajouter</button>
+    </div>`;
+}
+window.addPosition = () => {
+  const t = document.getElementById('p-ticker').value, q = document.getElementById('p-qty').value, pr = document.getElementById('p-pru').value, px = document.getElementById('p-prix').value;
+  if (!t||!q||!pr) return;
+  positions.push({id:Date.now(), ticker:t.toUpperCase(), qty:parseFloat(q.replace(',','.')), pru:parseFloat(pr.replace(',','.')), prix: px?parseFloat(px.replace(',','.')):parseFloat(pr.replace(',','.'))});
+  store.set('positions', positions); renderPortfolio();
+};
+window.removePosition = (id) => { positions = positions.filter(p=>p.id!==id); store.set('positions', positions); renderPortfolio(); };
+window.updatePrice = (id, val) => { positions = positions.map(p=>p.id===id?{...p, prix: parseFloat(val.replace(',','.'))||p.prix}:p); store.set('positions', positions); renderPortfolio(); };
+
+// ---- Analyse ----
+function renderAnalyse(result, error, loading) {
+  const el = document.getElementById('tab-analyse');
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Analyse en direct</div>
+      <input id="a-ticker" placeholder="Ticker (ex: AAPL, MC.PA)" />
+      <button onclick="runLive()">${loading ? 'Chargement…' : '↻ Analyser (données en direct)'}</button>
+      ${error ? `<div class="red" style="font-size:12px">${error}</div>` : ''}
+      ${!apiKey ? `<div class="muted-text">Ajoutez votre clé API Twelve Data dans l'onglet "Clé API".</div>` : ''}
+    </div>
+    ${result ? `
+      <div class="card muted" style="text-align:center">
+        <div class="muted-text">${result.ticker}</div>
+        <div class="score">${result.total}/100</div>
+        <div class="muted-text">Score technique composite — pas un conseil d'achat</div>
+      </div>
+      <div class="card">
+        ${result.breakdown.map(b => `
+          <div style="margin-bottom:10px">
+            <div class="row" style="font-size:12px"><span class="muted-text">${b.label}</span><span>${b.value}/${b.max}</span></div>
+            <div class="bar-bg"><div class="bar-fill" style="width:${b.value/b.max*100}%"></div></div>
+          </div>`).join('')}
+      </div>
+      <div class="card muted-text" style="font-size:13px;line-height:1.8">
+        <div>Dernier cours : ${fmt(result.raw.last)}</div>
+        <div>SMA20 : ${fmt(result.raw.s20)} · SMA50 : ${fmt(result.raw.s50)}</div>
+        <div>RSI(14) : ${result.raw.r!==null?fmt(result.raw.r,1):'—'}</div>
+        <div>MACD hist. : ${result.raw.m?fmt(result.raw.m.hist,3):'—'}</div>
+        <div>Momentum 20p : ${result.raw.mom!==null?fmt(result.raw.mom,1)+'%':'—'}</div>
+        <div>Volatilité annualisée : ${result.raw.vol!==null?fmt(result.raw.vol,1)+'%':'—'}</div>
+      </div>` : ''}`;
+}
+let lastResult = null;
+window.runLive = async () => {
+  const ticker = document.getElementById('a-ticker').value.trim();
+  if (!ticker) return;
+  if (!apiKey) { renderAnalyse(null, 'Ajoutez d\'abord une clé API dans l\'onglet dédié.', false); return; }
+  renderAnalyse(null, '', true);
+  try {
+    const series = await fetchSeries(ticker);
+    if (series.length < 15) throw new Error('Pas assez de données renvoyées par l\'API.');
+    const score = computeScore(series);
+    lastResult = { ...score, ticker };
+    renderAnalyse(lastResult, '', false);
+  } catch (e) {
+    renderAnalyse(null, e.message, false);
+  }
+};
+
+// ---- Watchlist ----
+function renderWatch() {
+  const el = document.getElementById('tab-watch');
+  const grouped = watchlist.reduce((acc,w)=>{ (acc[w.theme]=acc[w.theme]||[]).push(w); return acc; }, {});
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Ajouter à la watchlist</div>
+      <input id="w-ticker" placeholder="Ticker"/>
+      <input id="w-theme" placeholder="Thème / secteur"/>
+      <input id="w-note" placeholder="Note"/>
+      <button onclick="addWatch()">+ Ajouter</button>
+    </div>
+    ${Object.keys(grouped).length===0 ? `<div class="muted-text" style="text-align:center;padding:2rem 0">Aucune suggestion automatique — classez vous-même les actions que vous suivez.</div>` : ''}
+    ${Object.entries(grouped).map(([theme,items]) => `
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:8px;color:var(--accent)">${theme}</div>
+        ${items.map(w => `
+          <div class="row" style="align-items:start;margin-bottom:8px">
+            <div><div style="font-weight:600;font-size:14px">${w.ticker}</div>${w.note?`<div class="muted-text">${w.note}</div>`:''}</div>
+            <button class="del" onclick="removeWatch(${w.id})">✕</button>
+          </div>`).join('')}
+      </div>`).join('')}`;
+}
+window.addWatch = () => {
+  const t = document.getElementById('w-ticker').value, th = document.getElementById('w-theme').value, n = document.getElementById('w-note').value;
+  if (!t) return;
+  watchlist.push({id:Date.now(), ticker:t.toUpperCase(), theme: th||'Non classé', note:n});
+  store.set('watchlist', watchlist); renderWatch();
+};
+window.removeWatch = (id) => { watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); renderWatch(); };
+
+// ---- Config ----
+function renderConfig() {
+  const el = document.getElementById('tab-config');
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Clé API Twelve Data</div>
+      <div class="muted-text" style="margin-bottom:8px">Créez un compte gratuit sur twelvedata.com pour obtenir une clé. Plan gratuit : ~8 requêtes/minute. La clé est stockée uniquement sur votre téléphone (localStorage), jamais envoyée ailleurs qu'à Twelve Data.</div>
+      <input id="c-key" placeholder="Votre clé API" value="${apiKey}"/>
+      <button onclick="saveKey()">Enregistrer</button>
+    </div>`;
+}
+window.saveKey = () => { apiKey = document.getElementById('c-key').value.trim(); store.set('apiKey', apiKey); renderConfig(); };
+
+// ---- Tabs ----
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    ['portfolio','analyse','watch','config'].forEach(t => document.getElementById('tab-'+t).style.display = t===btn.dataset.tab ? 'block':'none');
+  });
+});
+
+renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(()=>{});
+}
+</script>
+</body>
+</html>

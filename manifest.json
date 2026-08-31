@@ -1,0 +1,9 @@
+{
+  "name": "Investissement",
+  "short_name": "Investissement",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f5f5f4",
+  "theme_color": "#f5f5f4",
+  "icons": []
+}
