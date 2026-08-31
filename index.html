@@ -169,30 +169,42 @@ async function fetchSeries(symbol) {
 }
 
 // ---- Portfolio ----
+let usdEurRate = store.get('usdEurRate', null);
+function toEur(p) { return p.currency === 'USD' && usdEurRate ? usdEurRate : 1; }
+
 function renderPortfolio(status) {
   const el = document.getElementById('tab-portfolio');
-  const totalValue = positions.reduce((a,p)=>a+p.qty*p.prix,0);
-  const totalCost = positions.reduce((a,p)=>a+p.qty*p.pru,0);
+  const hasUsd = positions.some(p=>p.currency==='USD');
+  const totalValue = positions.reduce((a,p)=>a+p.qty*p.prix*toEur(p),0);
+  const totalCost = positions.reduce((a,p)=>a+p.qty*p.pru*toEur(p),0);
   const pnl = totalValue-totalCost, pnlPct = totalCost ? pnl/totalCost*100 : 0;
   el.innerHTML = `
     <div class="card muted">
       <div class="row"><span class="muted-text">Valeur totale</span><span style="font-weight:600;font-size:18px">${fmt(totalValue)} €</span></div>
       <div class="row"><span class="muted-text">P&L latent</span><span class="${pnl>=0?'green':'red'}" style="font-weight:600">${fmt(pnl)} € (${fmt(pnlPct)}%)</span></div>
+      ${hasUsd ? `<div class="muted-text" style="margin-top:4px">Taux USD→EUR : ${usdEurRate ? fmt(usdEurRate,4) : 'inconnu — actualisez les prix'}</div>` : ''}
     </div>
     ${positions.length ? `<button onclick="refreshPrices()" ${status==='loading'?'disabled':''}>${status==='loading' ? 'Actualisation…' : '↻ Actualiser les prix'}</button>` : ''}
     ${status && status!=='loading' ? `<div class="muted-text" style="margin:-4px 0 8px">${status}</div>` : ''}
     ${positions.length>3 ? `<div class="muted-text" style="margin:-4px 0 8px">Plan gratuit Twelve Data : ~8 requêtes/minute, l'actualisation de plusieurs positions peut prendre du temps.</div>` : ''}
     ${positions.map(p => {
+      const sym = p.currency==='USD' ? '$' : '€';
       const pn = (p.prix-p.pru)*p.qty, pnp = p.pru ? (p.prix-p.pru)/p.pru*100 : 0;
       return `<div class="card">
         <div class="row">
-          <div><div style="font-weight:600">${p.ticker}</div><div class="muted-text">${p.qty} × ${fmt(p.pru)} € PRU</div></div>
+          <div><div style="font-weight:600">${p.ticker}</div><div class="muted-text">${p.qty} × ${fmt(p.pru)} ${sym} PRU</div></div>
           <button class="del" onclick="removePosition(${p.id})">✕</button>
         </div>
         <div class="row" style="margin-top:8px">
-          <div style="display:flex;align-items:center;gap:6px"><span class="muted-text">Prix</span>
-            <input style="width:70px;margin:0" value="${p.prix}" onchange="updatePrice(${p.id}, this.value)"/></div>
-          <span class="${pn>=0?'green':'red'}" style="font-weight:600">${fmt(pn)} € (${fmt(pnp)}%)</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="muted-text">Prix</span>
+            <input style="width:64px;margin:0" value="${p.prix}" onchange="updatePrice(${p.id}, this.value)"/>
+            <select style="width:64px;margin:0;padding:8px 4px" onchange="updateCurrency(${p.id}, this.value)">
+              <option value="EUR" ${p.currency==='EUR'?'selected':''}>EUR</option>
+              <option value="USD" ${p.currency==='USD'?'selected':''}>USD</option>
+            </select>
+          </div>
+          <span class="${pn>=0?'green':'red'}" style="font-weight:600">${fmt(pn)} ${sym} (${fmt(pnp)}%)</span>
         </div>
       </div>`;
     }).join('')}
@@ -204,14 +216,19 @@ function renderPortfolio(status) {
         <input id="p-pru" placeholder="Prix d'achat"/>
         <input id="p-prix" placeholder="Prix actuel (opt.)"/>
       </div>
+      <select id="p-currency" style="margin-bottom:8px">
+        <option value="EUR">EUR</option>
+        <option value="USD">USD</option>
+      </select>
       <button onclick="addPosition()">+ Ajouter</button>
     </div>`;
   attachAutocomplete(['p-ticker']);
 }
 window.addPosition = () => {
   const t = document.getElementById('p-ticker').value, q = document.getElementById('p-qty').value, pr = document.getElementById('p-pru').value, px = document.getElementById('p-prix').value;
+  const cur = document.getElementById('p-currency').value;
   if (!t||!q||!pr) return;
-  positions.push({id:Date.now(), ticker:t.toUpperCase(), qty:parseFloat(q.replace(',','.')), pru:parseFloat(pr.replace(',','.')), prix: px?parseFloat(px.replace(',','.')):parseFloat(pr.replace(',','.'))});
+  positions.push({id:Date.now(), ticker:t.toUpperCase(), qty:parseFloat(q.replace(',','.')), pru:parseFloat(pr.replace(',','.')), prix: px?parseFloat(px.replace(',','.')):parseFloat(pr.replace(',','.')), currency: cur});
   store.set('positions', positions); renderPortfolio();
 };
 window.removePosition = (id) => {
@@ -220,11 +237,22 @@ window.removePosition = (id) => {
   positions = positions.filter(p=>p.id!==id); store.set('positions', positions); renderPortfolio();
 };
 window.updatePrice = (id, val) => { positions = positions.map(p=>p.id===id?{...p, prix: parseFloat(val.replace(',','.'))||p.prix}:p); store.set('positions', positions); renderPortfolio(); };
+window.updateCurrency = (id, val) => { positions = positions.map(p=>p.id===id?{...p, currency: val}:p); store.set('positions', positions); renderPortfolio(); };
 window.refreshPrices = async () => {
   if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
   renderPortfolio('loading');
   const delay = (ms) => new Promise(r=>setTimeout(r,ms));
   let failed = [];
+  if (positions.some(p=>p.currency==='USD')) {
+    try {
+      const res = await fetch(`https://api.twelvedata.com/exchange_rate?symbol=USD/EUR&apikey=${apiKey}`);
+      const data = await res.json();
+      if (!(data.status==='error'||data.code) && Number.isFinite(parseFloat(data.rate))) {
+        usdEurRate = parseFloat(data.rate); store.set('usdEurRate', usdEurRate);
+      } else failed.push('taux USD→EUR');
+    } catch(e) { failed.push('taux USD→EUR'); }
+    await delay(1200);
+  }
   for (const p of positions) {
     try {
       const q = await fetchQuote(p.ticker);
