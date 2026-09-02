@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Investissement</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Investissement" />
+<style>
+  :root {
+    --bg: #f5f5f4; --card: #ffffff; --border: #e5e5e5;
+    --text: #111111; --text-2: #666666; --accent: #378ADD;
+    --green: #0f6e56; --red: #a32d2d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1c1a; --card: #262624; --border: #3a3a38; --text: #f0f0ee; --text-2: #a0a09a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,system-ui,sans-serif; padding-bottom:2rem; }
+  .wrap { max-width:480px; margin:0 auto; padding:1rem; }
+  .tabs { display:flex; gap:8px; margin-bottom:1rem; position:sticky; top:0; background:var(--bg); padding-top:0.5rem; z-index:10; }
+  .tab { flex:1; padding:10px 4px; text-align:center; border:0.5px solid var(--border); border-radius:10px; font-size:12px; background:transparent; color:var(--text-2); cursor:pointer; }
+  .tab.active { background:var(--card); color:var(--text); font-weight:600; }
+  .card { background:var(--card); border:0.5px solid var(--border); border-radius:12px; padding:1rem 1.1rem; margin-bottom:12px; }
+  .card.muted { background:var(--bg); }
+  input, textarea, button { width:100%; font-size:14px; padding:8px 10px; border-radius:8px; border:0.5px solid var(--border); background:var(--bg); color:var(--text); margin-bottom:8px; font-family:inherit; }
+  button { cursor:pointer; font-weight:600; background:var(--card); }
+  button:active { transform:scale(0.98); }
+  .row { display:flex; justify-content:space-between; align-items:center; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .muted-text { color:var(--text-2); font-size:12px; }
+  .green { color:var(--green); } .red { color:var(--red); }
+  .score { font-size:40px; font-weight:700; text-align:center; margin:4px 0; }
+  .bar-bg { height:6px; background:var(--bg); border-radius:3px; margin-top:4px; }
+  .bar-fill { height:6px; background:var(--accent); border-radius:3px; }
+  .del { border:none; background:none; color:var(--red); font-size:18px; padding:0; width:auto; }
+  h2 { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2 id="sr-title">Outil d'aide à l'investissement : portfolio, analyse d'action et watchlist</h2>
+  <div class="tabs">
+    <button class="tab" data-tab="portfolio">Portfolio</button>
+    <button class="tab" data-tab="analyse">Analyse</button>
+    <button class="tab" data-tab="watch">Watchlist</button>
+    <button class="tab" data-tab="config">Clé API</button>
+  </div>
+
+  <div id="tab-portfolio"></div>
+  <div id="tab-analyse" style="display:none"></div>
+  <div id="tab-watch" style="display:none"></div>
+  <div id="tab-config" style="display:none"></div>
+  <datalist id="ticker-suggestions"></datalist>
+</div>
+
+<script>
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch(e) { return d; } },
+  set(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
+};
+
+const TTL = { quote: 15*60*1000, series: 60*60*1000, rate: 60*60*1000, search: 10*60*1000 };
+function cacheGet(key, ttl) {
+  const c = store.get('cache_'+key, null);
+  if (!c || Date.now()-c.t > ttl) return null;
+  return c.v;
+}
+function cacheSet(key, v) { store.set('cache_'+key, { v, t: Date.now() }); }
+function clearCache() { Object.keys(localStorage).filter(k=>k.startsWith('cache_')).forEach(k=>localStorage.removeItem(k)); }
+
+let transactions = store.get('transactions', []);
+let tickerMeta = store.get('tickerMeta', {});
+let prices = store.get('prices', {});
+let watchlist = store.get('watchlist', []);
+let apiKey = store.get('apiKey', '');
+
+// Migration ponctuelle depuis l'ancien modèle "positions" (une ligne = une position)
+(function migrate() {
+  if (store.get('migratedToTx', false)) return;
+  const oldPositions = store.get('positions', []);
+  if (oldPositions.length) {
+    oldPositions.forEach(p => {
+      transactions.push({ id: p.id, ticker: p.ticker, type:'buy', qty: p.qty, price: p.pru, date: new Date().toISOString().slice(0,10), });
+      tickerMeta[p.ticker] = { currency: p.currency || 'EUR' };
+      prices[p.ticker] = p.prix;
+    });
+    store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices);
+  }
+  store.set('migratedToTx', true);
+})();
+
+const fmt = (n, d=2) => Number.isFinite(n) ? n.toLocaleString('fr-FR', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
+
+// ---- indicateurs ----
+function sma(arr, p) { const s = arr.slice(-p); return s.length ? s.reduce((a,b)=>a+b,0)/s.length : null; }
+function ema(arr, p) { if (!arr.length) return []; const k = 2/(p+1); const out=[arr[0]]; for (let i=1;i<arr.length;i++) out.push(arr[i]*k + out[i-1]*(1-k)); return out; }
+function rsi(arr, p=14) { if (arr.length < p+1) return null; const ch = arr.slice(1).map((v,i)=>v-arr[i]).slice(-p);
+  const g = ch.filter(c=>c>0).reduce((a,b)=>a+b,0)/p; const l = -ch.filter(c=>c<0).reduce((a,b)=>a+b,0)/p;
+  if (l===0) return 100; return 100 - 100/(1+g/l); }
+function macd(arr) { if (arr.length<26) return null; const e12=ema(arr,12), e26=ema(arr,26);
+  const line=e12.map((v,i)=>v-e26[i]); const sig=ema(line.slice(-Math.max(line.length-25,9)),9);
+  const histSeries = sig.map((v,i)=> line[line.length-sig.length+i] - v).slice(-5);
+  return { macd: line[line.length-1], signal: sig[sig.length-1], hist: histSeries[histSeries.length-1], histSeries }; }
+function volat(arr) { if (arr.length<2) return null; const r = arr.slice(1).map((v,i)=>(v-arr[i])/arr[i]);
+  const m = r.reduce((a,b)=>a+b,0)/r.length; const v = r.reduce((a,b)=>a+(b-m)**2,0)/r.length;
+  return Math.sqrt(v)*Math.sqrt(252)*100; }
+function momentum(arr, p=20) { if (arr.length<p+1) return null; const past=arr[arr.length-1-p], last=arr[arr.length-1]; return (last-past)/past*100; }
+
+function perScore(per) {
+  if (per===null || !Number.isFinite(per) || per<=0) return 6.5; // neutre si absent
+  if (per < 15) return 13;
+  if (per < 20) return 10;
+  if (per < 25) return 8;
+  if (per < 35) return 4;
+  return 2;
+}
+function obv(closes, volumes) {
+  if (!volumes || volumes.length !== closes.length || volumes.some(v=>!Number.isFinite(v))) return null;
+  let o = 0; const series=[0];
+  for (let i=1;i<closes.length;i++) {
+    if (closes[i]>closes[i-1]) o += volumes[i];
+    else if (closes[i]<closes[i-1]) o -= volumes[i];
+    series.push(o);
+  }
+  return series;
+}
+
+function computeScore(arr, opts={}) {
+  const { per=null, benchmarkArr=null, volumes=null } = opts;
+  const last=arr[arr.length-1], s20=sma(arr,20), s50=sma(arr,50), r=rsi(arr,14), m=macd(arr), vol=volat(arr), mom=momentum(arr,20);
+  let trend=0;
+  if (s20 && s50) { if (last>s20 && s20>s50) trend=18; else if (last>s20||last>s50) trend=11; else if (last<s20&&s20<s50) trend=0; else trend=5; }
+  else if (s20) trend = last>s20 ? 13 : 4;
+  let rsiS=7;
+  if (r!==null) { if (r>=45&&r<=65) rsiS=13; else if (r>65&&r<=75) rsiS=9; else if (r>=30&&r<45) rsiS=10; else if (r>75) rsiS=4; else rsiS=5; }
+  let macdS=7, macdTrend=0;
+  if (m) {
+    if (m.hist>0&&m.macd>0) macdS=11; else if (m.hist>0) macdS=7; else if (m.hist<0&&m.macd<0) macdS=2; else macdS=5;
+    if (m.histSeries && m.histSeries.length>=2) {
+      macdTrend = m.histSeries[m.histSeries.length-1] - m.histSeries[0];
+      macdS += macdTrend > 0 ? 2 : macdTrend < 0 ? -2 : 0;
+      macdS = Math.max(0, Math.min(13, macdS));
+    }
+  }
+  let momS = mom!==null ? Math.max(0,Math.min(13,6.5+mom*0.325)) : 6.5;
+  let volS = vol!==null ? Math.max(0,Math.min(9,9-vol/6.67)) : 4.5;
+  const perS = perScore(per);
+  let relS = 4.5; // neutre si pas de benchmark
+  let relMom = null;
+  if (benchmarkArr && benchmarkArr.length>20) {
+    const benchMom = momentum(benchmarkArr,20);
+    if (mom!==null && benchMom!==null) {
+      relMom = mom - benchMom;
+      relS = Math.max(0, Math.min(9, 4.5 + relMom*0.27));
+    }
+  }
+  const obvSeries = volumes ? obv(arr, volumes) : null;
+  let obvTrend = null, obvS = 6;
+  if (obvSeries && obvSeries.length>21) {
+    obvTrend = obvSeries[obvSeries.length-1] - obvSeries[obvSeries.length-21];
+    if (mom!==null) {
+      if ((obvTrend>0 && mom>0) || (obvTrend<0 && mom<0)) obvS = 12; // volume confirme la tendance
+      else if ((obvTrend>0 && mom<0) || (obvTrend<0 && mom>0)) obvS = 2; // divergence volume/prix
+      else obvS = 6;
+    }
+  }
+  const total = Math.max(0,Math.min(100, Math.round(trend+rsiS+macdS+momS+volS+perS+relS+obvS)));
+  return { total, breakdown:[
+    {label:'Tendance (prix vs SMA20/50)', value:Math.round(trend), max:18},
+    {label:'RSI (14)', value:Math.round(rsiS), max:13},
+    {label:'MACD', value:Math.round(macdS), max:13},
+    {label:'Momentum (20 périodes)', value:Math.round(momS), max:13},
+    {label:'Volatilité (stabilité)', value:Math.round(volS), max:9},
+    {label:'PER', value:Math.round(perS), max:13},
+    {label:'Performance vs indice', value:Math.round(relS), max:9},
+    {label:'Volume (OBV)', value:Math.round(obvS), max:12},
+  ], raw:{last,s20,s50,r,m,vol,mom,per,relMom,macdTrend,obvTrend} };
+}
+
+async function searchSymbols(q) {
+  if (!apiKey || q.length<2) return;
+  const key = q.toLowerCase();
+  const cached = cacheGet('search_'+key, TTL.search);
+  const dl = document.getElementById('ticker-suggestions');
+  if (cached) { dl.innerHTML = cached.map(s => `<option value="${s.symbol}">${s.name||''}</option>`).join(''); return; }
+  try {
+    const res = await fetch(`https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(q)}&apikey=${apiKey}`);
+    const data = await res.json();
+    const list = (data.data||[]).slice(0,8).map(s => ({symbol:s.symbol, name:s.instrument_name||''}));
+    cacheSet('search_'+key, list);
+    dl.innerHTML = list.map(s => `<option value="${s.symbol}">${s.name}</option>`).join('');
+  } catch(e) { /* pas de suggestion, tant pis */ }
+}
+let searchTimer = null;
+function debouncedSearch(val) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => searchSymbols(val), 400);
+}
+function attachAutocomplete(ids) {
+  ids.forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener('input', (e) => debouncedSearch(e.target.value));
+  });
+}
+
+// ---- API Twelve Data ----
+async function fetchQuote(symbol) {
+  const cached = cacheGet('quote_'+symbol, TTL.quote);
+  if (cached) return cached;
+  const res = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`);
+  const data = await res.json();
+  if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
+  cacheSet('quote_'+symbol, data);
+  return data;
+}
+async function fetchSeries(symbol) {
+  const cached = cacheGet('series_'+symbol, TTL.series);
+  if (cached) return cached;
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=250&apikey=${apiKey}`);
+  const data = await res.json();
+  if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
+  const values = [...data.values].reverse();
+  const result = { closes: values.map(v => parseFloat(v.close)), volumes: values.map(v => parseFloat(v.volume)) };
+  cacheSet('series_'+symbol, result);
+  return result;
+}
+
+// ---- Portfolio ----
+let usdEurRate = store.get('usdEurRate', null);
+function rateFor(ticker) { return (tickerMeta[ticker]?.currency === 'USD' && usdEurRate) ? usdEurRate : 1; }
+function symFor(ticker) { return tickerMeta[ticker]?.currency === 'USD' ? '$' : '€'; }
+
+function txForTicker(ticker) {
+  return transactions.filter(t=>t.ticker===ticker).sort((a,b)=> a.date.localeCompare(b.date) || a.id-b.id);
+}
+function computeAgg(ticker) {
+  let qty=0, pru=0, realized=0;
+  txForTicker(ticker).forEach(tx => {
+    if (tx.type==='buy') { pru = (qty+tx.qty)>0 ? (qty*pru + tx.qty*tx.price)/(qty+tx.qty) : tx.price; qty += tx.qty; }
+    else { realized += (tx.price - pru) * tx.qty; qty = Math.max(0, qty - tx.qty); }
+  });
+  return { qty, pru, realized };
+}
+function allTickers() { return [...new Set(transactions.map(t=>t.ticker))]; }
+
+function computeTotals() {
+  const tickers = allTickers();
+  let totalValue=0, totalCostBasis=0, totalRealized=0;
+  const aggs = {};
+  tickers.forEach(t => {
+    const agg = computeAgg(t); aggs[t]=agg;
+    const rate = rateFor(t); const price = prices[t] ?? agg.pru;
+    totalValue += agg.qty*price*rate;
+    totalCostBasis += agg.qty*agg.pru*rate;
+    totalRealized += agg.realized*rate;
+  });
+  return { tickers, aggs, totalValue, totalCostBasis, totalRealized };
+}
+
+// TRI (XIRR) : rendement annualisé réel tenant compte des dates de chaque transaction —
+// contrairement au PRU pondéré qui ignore la durée de détention.
+function daysBetween(d1, d2) { return (new Date(d2) - new Date(d1)) / 86400000; }
+function xnpv(rate, flows) {
+  const d0 = flows[0].date;
+  return flows.reduce((sum,f)=> sum + f.amount / Math.pow(1+rate, daysBetween(d0,f.date)/365), 0);
+}
+function xirr(flows) {
+  if (flows.length < 2) return null;
+  let rate = 0.1;
+  for (let i=0;i<60;i++) {
+    const npv = xnpv(rate, flows);
+    const d = (xnpv(rate+1e-5, flows) - npv) / 1e-5;
+    if (Math.abs(d) < 1e-9) return null;
+    const next = rate - npv/d;
+    if (!Number.isFinite(next) || next < -0.99) return null;
+    if (Math.abs(next-rate) < 1e-7) return next;
+    rate = next;
+  }
+  return null;
+}
+function computeXirr() {
+  const flows = transactions.map(tx => ({
+    date: tx.date,
+    amount: (tx.type==='buy' ? -1 : 1) * tx.qty * tx.price * rateFor(tx.ticker)
+  })).sort((a,b)=>a.date.localeCompare(b.date));
+  const { totalValue } = computeTotals();
+  if (!flows.length || totalValue<=0) return null;
+  flows.push({ date: new Date().toISOString().slice(0,10), amount: totalValue });
+  return xirr(flows);
+}
+
+// Historique de la valeur totale (un point par jour)
+let valueHistory = store.get('valueHistory', []);
+function snapshotValue() {
+  const { totalValue } = computeTotals();
+  if (totalValue<=0) return;
+  const today = new Date().toISOString().slice(0,10);
+  const idx = valueHistory.findIndex(h=>h.date===today);
+  if (idx>=0) valueHistory[idx].value = totalValue; else valueHistory.push({date:today, value:totalValue});
+  valueHistory = valueHistory.slice(-180);
+  store.set('valueHistory', valueHistory);
+}
+function historySvg() {
+  if (valueHistory.length<2) return '';
+  const w=440,h=100,pad=4;
+  const vals = valueHistory.map(x=>x.value);
+  const min=Math.min(...vals), max=Math.max(...vals);
+  const range = (max-min)||1;
+  const pts = valueHistory.map((pt,i)=> {
+    const x = pad + i*(w-2*pad)/(valueHistory.length-1);
+    const y = h-pad - ((pt.value-min)/range)*(h-2*pad);
+    return `${x},${y}`;
+  }).join(' ');
+  const up = vals[vals.length-1] >= vals[0];
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:${h}px">
+    <polyline points="${pts}" fill="none" stroke="${up?'#0f6e56':'#a32d2d'}" stroke-width="2"/>
+  </svg>`;
+}
+
+let expandedTicker = null;
+let tickerScores = {}; // en mémoire uniquement, pas persisté (données live)
+let scoreLoading = {};
+let benchmarkCache = null;
+
+async function calcTickerScore(t) {
+  if (!apiKey) { tickerScores[t] = { error: "Ajoutez d'abord une clé API dans l'onglet dédié." }; renderPortfolio(); renderWatch(); return; }
+  scoreLoading[t] = true; renderPortfolio(); renderWatch();
+  try {
+    const seriesWasCached = !!cacheGet('series_'+t, TTL.series);
+    const series = await fetchSeries(t);
+    if (series.closes.length < 15) throw new Error('Pas assez de données renvoyées par l\'API.');
+    if (!seriesWasCached) await new Promise(r=>setTimeout(r,1200));
+    if (!benchmarkCache) {
+      const benchWasCached = !!cacheGet('series_SPY', TTL.series);
+      try { benchmarkCache = await fetchSeries('SPY'); if (!benchWasCached) await new Promise(r=>setTimeout(r,1200)); } catch(e) { benchmarkCache = null; }
+    }
+    const per = tickerMeta[t]?.per ? parseFloat(tickerMeta[t].per) : null;
+    tickerScores[t] = computeScore(series.closes, { per, benchmarkArr: benchmarkCache ? benchmarkCache.closes : null, volumes: series.volumes });
+  } catch (e) {
+    tickerScores[t] = { error: e.message };
+  }
+  scoreLoading[t] = false;
+  renderPortfolio(); renderWatch();
+}
+window.calcTickerScore = calcTickerScore;
+window.setTickerPer = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), per: val }; store.set('tickerMeta', tickerMeta); };
+
+function renderPortfolio(status) {
+  const el = document.getElementById('tab-portfolio');
+  const { tickers, aggs, totalValue, totalCostBasis, totalRealized } = computeTotals();
+  const hasUsd = tickers.some(t=>tickerMeta[t]?.currency==='USD');
+  const unrealized = totalValue-totalCostBasis;
+  const unrealizedPct = totalCostBasis ? unrealized/totalCostBasis*100 : 0;
+  const totalPnl = unrealized+totalRealized;
+  const tri = computeXirr();
+  const chart = historySvg();
+
+  el.innerHTML = `
+    <div class="card muted">
+      <div class="row"><span class="muted-text">Valeur totale</span><span style="font-weight:600;font-size:18px">${fmt(totalValue)} €</span></div>
+      <div class="row"><span class="muted-text">P&L latent</span><span class="${unrealized>=0?'green':'red'}" style="font-weight:600">${fmt(unrealized)} € (${fmt(unrealizedPct)}%)</span></div>
+      <div class="row"><span class="muted-text">Gains réalisés (cumulés)</span><span class="${totalRealized>=0?'green':'red'}" style="font-weight:600">${fmt(totalRealized)} €</span></div>
+      <div class="row" style="margin-top:4px;border-top:0.5px solid var(--border);padding-top:4px"><span class="muted-text">P&L total</span><span class="${totalPnl>=0?'green':'red'}" style="font-weight:700">${fmt(totalPnl)} €</span></div>
+      ${tri!==null ? `<div class="row" style="margin-top:4px"><span class="muted-text">Rendement annualisé (TRI)</span><span class="${tri>=0?'green':'red'}" style="font-weight:600">${fmt(tri*100,1)}%/an</span></div>` : ''}
+      ${hasUsd ? `<div class="muted-text" style="margin-top:4px">Taux USD→EUR : ${usdEurRate ? fmt(usdEurRate,4) : 'inconnu — actualisez les prix'}</div>` : ''}
+    </div>
+    ${chart ? `<div class="card"><div class="muted-text" style="margin-bottom:4px">Évolution de la valeur (${valueHistory.length} points)</div>${chart}</div>` : ''}
+    ${tickers.length ? `<button onclick="refreshPrices()" ${status==='loading'?'disabled':''}>${status==='loading' ? 'Actualisation…' : '↻ Actualiser les prix'}</button>` : ''}
+    ${status && status!=='loading' ? `<div class="muted-text" style="margin:-4px 0 8px">${status}</div>` : ''}
+    ${tickers.length>3 ? `<div class="muted-text" style="margin:-4px 0 8px">Plan gratuit Twelve Data : ~8 requêtes/minute, l'actualisation peut prendre du temps.</div>` : ''}
+    ${tickers.map(t => {
+      const agg = aggs[t]; const sym = symFor(t); const price = prices[t] ?? agg.pru;
+      const unrl = (price-agg.pru)*agg.qty; const unrlPct = agg.pru ? (price-agg.pru)/agg.pru*100 : 0;
+      const isOpen = expandedTicker === t;
+      return `<div class="card">
+        <div class="row">
+          <div><div style="font-weight:600">${t}</div><div class="muted-text">${fmt(agg.qty,4)} × ${fmt(agg.pru)} ${sym} PRU moyen</div></div>
+          <button class="del" onclick="removeTicker('${t}')">✕</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="muted-text">Prix</span>
+            <input style="width:64px;margin:0" value="${price}" onchange="updateTickerPrice('${t}', this.value)"/>
+            <select style="width:64px;margin:0;padding:8px 4px" onchange="updateTickerCurrency('${t}', this.value)">
+              <option value="EUR" ${sym==='€'?'selected':''}>EUR</option>
+              <option value="USD" ${sym==='$'?'selected':''}>USD</option>
+            </select>
+          </div>
+          <span class="${unrl>=0?'green':'red'}" style="font-weight:600">${fmt(unrl)} ${sym} (${fmt(unrlPct)}%)</span>
+        </div>
+        ${agg.realized ? `<div class="muted-text" style="margin-top:4px">Réalisé : ${fmt(agg.realized)} ${sym}</div>` : ''}
+        <div class="row" style="margin-top:8px;gap:6px">
+          <input placeholder="PER (optionnel)" style="margin:0" value="${tickerMeta[t]?.per||''}" onchange="setTickerPer('${t}', this.value)"/>
+          <button style="width:auto;white-space:nowrap;margin:0" onclick="calcTickerScore('${t}')" ${scoreLoading[t]?'disabled':''}>${scoreLoading[t]?'…':(tickerScores[t]&&!tickerScores[t].error?'↻ Score':'Calculer le score')}</button>
+        </div>
+        ${tickerScores[t] ? (tickerScores[t].error
+          ? `<div class="red" style="font-size:12px;margin-top:4px">${tickerScores[t].error}</div>`
+          : `<div class="row" style="margin-top:8px;align-items:center">
+               <span class="muted-text" style="font-size:12px">Score technique</span>
+               <span style="font-weight:700;font-size:18px;color:${tickerScores[t].total>=60?'#0f6e56':tickerScores[t].total>=40?'#b8860b':'#a32d2d'}">${tickerScores[t].total}/100</span>
+             </div>`) : ''}
+        <button style="margin-top:8px" onclick="toggleTicker('${t}')">${isOpen?'▲ Masquer les transactions':'▼ Voir les transactions ('+txForTicker(t).length+')'}</button>
+        ${isOpen ? txForTicker(t).map(tx => `
+          <div class="row" style="font-size:12px;padding:4px 0;border-top:0.5px solid var(--border)">
+            <span>${tx.date} · ${tx.type==='buy'?'Achat':'Vente'} ${fmt(tx.qty,4)} @ ${fmt(tx.price)} ${sym}</span>
+            <button class="del" style="font-size:14px" onclick="removeTransaction(${tx.id})">✕</button>
+          </div>`).join('') : ''}
+      </div>`;
+    }).join('')}
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Ajouter une transaction</div>
+      <div class="grid2">
+        <input id="p-ticker" list="ticker-suggestions" placeholder="Ticker"/>
+        <select id="p-type"><option value="buy">Achat</option><option value="sell">Vente</option></select>
+        <input id="p-qty" placeholder="Quantité"/>
+        <input id="p-price" placeholder="Prix"/>
+      </div>
+      <input id="p-date" type="date" value="${new Date().toISOString().slice(0,10)}"/>
+      <select id="p-currency">
+        <option value="EUR">EUR</option>
+        <option value="USD">USD</option>
+      </select>
+      <button onclick="addTransaction()">+ Ajouter la transaction</button>
+    </div>`;
+  attachAutocomplete(['p-ticker']);
+}
+window.toggleTicker = (t) => { expandedTicker = expandedTicker===t ? null : t; renderPortfolio(); };
+window.addTransaction = () => {
+  const t = document.getElementById('p-ticker').value.trim().toUpperCase();
+  const type = document.getElementById('p-type').value;
+  const q = document.getElementById('p-qty').value;
+  const pr = document.getElementById('p-price').value;
+  const date = document.getElementById('p-date').value;
+  const cur = document.getElementById('p-currency').value;
+  if (!t||!q||!pr||!date) return;
+  const qty = parseFloat(q.replace(',','.')), price = parseFloat(pr.replace(',','.'));
+  if (type==='sell') {
+    const agg = computeAgg(t);
+    if (qty > agg.qty + 1e-9) { alert(`Vous ne détenez que ${fmt(agg.qty,4)} ${t}, impossible de vendre ${fmt(qty,4)}.`); return; }
+  }
+  transactions.push({ id: Date.now(), ticker:t, type, qty, price, date });
+  if (!tickerMeta[t]) tickerMeta[t] = { currency: cur };
+  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta);
+  document.getElementById('p-ticker').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
+  renderPortfolio();
+};
+window.removeTransaction = (id) => {
+  if (!confirm('Supprimer cette transaction ? Le PRU et le P&L seront recalculés.')) return;
+  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); renderPortfolio();
+};
+window.removeTicker = (t) => {
+  if (!confirm(`Supprimer TOUTES les transactions ${t} ?`)) return;
+  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); renderPortfolio();
+};
+window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); renderPortfolio(); };
+window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); renderPortfolio(); };
+window.refreshPrices = async () => {
+  if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
+  renderPortfolio('loading');
+  const delay = (ms) => new Promise(r=>setTimeout(r,ms));
+  const tickers = allTickers();
+  let failed = [];
+  if (tickers.some(t=>tickerMeta[t]?.currency==='USD')) {
+    const cachedRate = cacheGet('rate_USDEUR', TTL.rate);
+    if (cachedRate) { usdEurRate = cachedRate; store.set('usdEurRate', usdEurRate); }
+    else {
+      try {
+        const res = await fetch(`https://api.twelvedata.com/exchange_rate?symbol=USD/EUR&apikey=${apiKey}`);
+        const data = await res.json();
+        if (!(data.status==='error'||data.code) && Number.isFinite(parseFloat(data.rate))) {
+          usdEurRate = parseFloat(data.rate); store.set('usdEurRate', usdEurRate); cacheSet('rate_USDEUR', usdEurRate);
+        } else failed.push('taux USD→EUR');
+      } catch(e) { failed.push('taux USD→EUR'); }
+      await delay(1200);
+    }
+  }
+  for (const t of tickers) {
+    const cachedQuote = cacheGet('quote_'+t, TTL.quote);
+    if (cachedQuote) { const price = parseFloat(cachedQuote.close); if (Number.isFinite(price)) prices[t]=price; continue; }
+    try {
+      const q = await fetchQuote(t);
+      const price = parseFloat(q.close);
+      if (Number.isFinite(price)) prices[t] = price;
+    } catch (e) { failed.push(t); }
+    await delay(1200);
+  }
+  store.set('prices', prices);
+  snapshotValue();
+  renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.');
+};
+
+// ---- Analyse ----
+function renderAnalyse(result, error, loading) {
+  const el = document.getElementById('tab-analyse');
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Analyse en direct</div>
+      <input id="a-ticker" list="ticker-suggestions" placeholder="Ticker (ex: AAPL, MC.PA)" value="${store.get('lastTicker','')}" />
+      <input id="a-per" placeholder="PER (optionnel, sinon neutre)" value="${store.get('lastPer','')}" />
+      <input id="a-bench" list="ticker-suggestions" placeholder="Indice de référence (défaut: SPY)" value="${store.get('lastBench','')}" />
+      <button onclick="runLive()">${loading ? 'Chargement…' : '↻ Analyser (données en direct)'}</button>
+      ${error ? `<div class="red" style="font-size:12px">${error}</div>` : ''}
+      ${!apiKey ? `<div class="muted-text">Ajoutez votre clé API Twelve Data dans l'onglet "Clé API".</div>` : ''}
+    </div>
+    ${result ? `
+      <div class="card muted" style="text-align:center">
+        <div class="muted-text">${result.ticker}</div>
+        <div class="score">${result.total}/100</div>
+        <div class="muted-text">Score technique composite — pas un conseil d'achat</div>
+      </div>
+      <div class="card">
+        ${result.breakdown.map(b => `
+          <div style="margin-bottom:10px">
+            <div class="row" style="font-size:12px"><span class="muted-text">${b.label}</span><span>${b.value}/${b.max}</span></div>
+            <div class="bar-bg"><div class="bar-fill" style="width:${b.value/b.max*100}%"></div></div>
+          </div>`).join('')}
+      </div>
+      <div class="card muted-text" style="font-size:13px;line-height:1.8">
+        <div>Dernier cours : ${fmt(result.raw.last)}</div>
+        <div>SMA20 : ${fmt(result.raw.s20)} · SMA50 : ${fmt(result.raw.s50)}</div>
+        <div>RSI(14) : ${result.raw.r!==null?fmt(result.raw.r,1):'—'}</div>
+        <div>MACD hist. : ${result.raw.m?fmt(result.raw.m.hist,3):'—'} ${result.raw.macdTrend ? (result.raw.macdTrend>0?'↗ en hausse (5 séances)':'↘ en baisse (5 séances)') : ''}</div>
+        <div>Momentum 20p : ${result.raw.mom!==null?fmt(result.raw.mom,1)+'%':'—'}</div>
+        <div>Volatilité annualisée : ${result.raw.vol!==null?fmt(result.raw.vol,1)+'%':'—'}</div>
+        <div>PER utilisé : ${result.raw.per!==null?fmt(result.raw.per,1):'— (neutre)'}</div>
+        <div>Perf. relative vs indice (20p) : ${result.raw.relMom!==null?fmt(result.raw.relMom,1)+' pts':'— (neutre)'}</div>
+        <div>Volume (OBV, 20p) : ${result.raw.obvTrend!==null?(result.raw.obvTrend>0?'↗ en accumulation':'↘ en distribution'):'— (données volume indisponibles)'}</div>
+      </div>` : ''}`;
+  attachAutocomplete(['a-ticker','a-bench']);
+}
+let lastResult = null;
+window.runLive = async () => {
+  const ticker = document.getElementById('a-ticker').value.trim();
+  const perInput = document.getElementById('a-per').value.trim();
+  const bench = document.getElementById('a-bench').value.trim() || 'SPY';
+  if (!ticker) return;
+  store.set('lastTicker', ticker); store.set('lastPer', perInput); store.set('lastBench', document.getElementById('a-bench').value.trim());
+  if (!apiKey) { renderAnalyse(null, 'Ajoutez d\'abord une clé API dans l\'onglet dédié.', false); return; }
+  renderAnalyse(null, '', true);
+  try {
+    const seriesWasCached = !!cacheGet('series_'+ticker, TTL.series);
+    const series = await fetchSeries(ticker);
+    if (series.closes.length < 15) throw new Error('Pas assez de données renvoyées par l\'API.');
+    if (!seriesWasCached) await new Promise(r=>setTimeout(r,1200));
+    let benchSeries = null;
+    const benchWasCached = !!cacheGet('series_'+bench, TTL.series);
+    try { benchSeries = await fetchSeries(bench); if (!benchWasCached) await new Promise(r=>setTimeout(r,1200)); } catch(e) { /* comparaison indisponible, on reste neutre */ }
+    const per = perInput ? parseFloat(perInput.replace(',','.')) : null;
+    const score = computeScore(series.closes, { per, benchmarkArr: benchSeries ? benchSeries.closes : null, volumes: series.volumes });
+    lastResult = { ...score, ticker };
+    renderAnalyse(lastResult, '', false);
+  } catch (e) {
+    renderAnalyse(null, e.message, false);
+  }
+};
+
+// ---- Watchlist ----
+function renderWatch() {
+  const el = document.getElementById('tab-watch');
+  const grouped = watchlist.reduce((acc,w)=>{ (acc[w.theme]=acc[w.theme]||[]).push(w); return acc; }, {});
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Ajouter à la watchlist</div>
+      <input id="w-ticker" list="ticker-suggestions" placeholder="Ticker"/>
+      <input id="w-theme" placeholder="Thème / secteur"/>
+      <input id="w-note" placeholder="Note"/>
+      <button onclick="addWatch()">+ Ajouter</button>
+    </div>
+    ${Object.keys(grouped).length===0 ? `<div class="muted-text" style="text-align:center;padding:2rem 0">Aucune suggestion automatique — classez vous-même les actions que vous suivez.</div>` : ''}
+    ${Object.entries(grouped).map(([theme,items]) => `
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:8px;color:var(--accent)">${theme}</div>
+        ${items.map(w => `
+          <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:0.5px solid var(--border)">
+            <div class="row" style="align-items:start">
+              <div><div style="font-weight:600;font-size:14px">${w.ticker}</div>${w.note?`<div class="muted-text">${w.note}</div>`:''}</div>
+              <button class="del" onclick="removeWatch(${w.id})">✕</button>
+            </div>
+            <div class="row" style="margin-top:6px;gap:6px">
+              <input placeholder="PER (opt.)" style="margin:0" value="${tickerMeta[w.ticker]?.per||''}" onchange="setTickerPer('${w.ticker}', this.value)"/>
+              <button style="width:auto;white-space:nowrap;margin:0" onclick="calcTickerScore('${w.ticker}')" ${scoreLoading[w.ticker]?'disabled':''}>${scoreLoading[w.ticker]?'…':(tickerScores[w.ticker]&&!tickerScores[w.ticker].error?'↻ Score':'Calculer le score')}</button>
+            </div>
+            ${tickerScores[w.ticker] ? (tickerScores[w.ticker].error
+              ? `<div class="red" style="font-size:12px;margin-top:4px">${tickerScores[w.ticker].error}</div>`
+              : `<div class="row" style="margin-top:6px;align-items:center">
+                   <span class="muted-text" style="font-size:12px">Score technique</span>
+                   <span style="font-weight:700;font-size:16px;color:${tickerScores[w.ticker].total>=60?'#0f6e56':tickerScores[w.ticker].total>=40?'#b8860b':'#a32d2d'}">${tickerScores[w.ticker].total}/100</span>
+                 </div>`) : ''}
+          </div>`).join('')}
+      </div>`).join('')}`;
+  attachAutocomplete(['w-ticker']);
+}
+window.addWatch = () => {
+  const t = document.getElementById('w-ticker').value, th = document.getElementById('w-theme').value, n = document.getElementById('w-note').value;
+  if (!t) return;
+  watchlist.push({id:Date.now(), ticker:t.toUpperCase(), theme: th||'Non classé', note:n});
+  store.set('watchlist', watchlist); renderWatch();
+};
+window.removeWatch = (id) => {
+  const w = watchlist.find(x=>x.id===id);
+  if (!confirm(`Retirer ${w ? w.ticker : 'cet élément'} de la watchlist ?`)) return;
+  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); renderWatch();
+};
+
+// ---- Config ----
+function renderConfig() {
+  const el = document.getElementById('tab-config');
+  const cacheCount = Object.keys(localStorage).filter(k=>k.startsWith('cache_')).length;
+  el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Clé API Twelve Data</div>
+      <div class="muted-text" style="margin-bottom:8px">Créez un compte gratuit sur twelvedata.com pour obtenir une clé. Plan gratuit : ~8 requêtes/minute. La clé est stockée uniquement sur votre téléphone (localStorage), jamais envoyée ailleurs qu'à Twelve Data.</div>
+      <input id="c-key" placeholder="Votre clé API" value="${apiKey}"/>
+      <button onclick="saveKey()">Enregistrer</button>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Cache local</div>
+      <div class="muted-text" style="margin-bottom:8px">Les prix (15 min), séries de cours (1h), taux de change (1h) et recherches de tickers (10 min) sont mis en cache sur votre téléphone pour économiser des appels API. ${cacheCount} entrée(s) actuellement.</div>
+      <button onclick="if(confirm('Vider le cache ? Les prochaines actions referont des appels API frais.')){clearCache();renderConfig();}">Vider le cache</button>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Sauvegarde (export / import)</div>
+      <div class="muted-text" style="margin-bottom:8px">Vos données (transactions, watchlist, prix) ne vivent que sur ce téléphone. Exportez-les régulièrement pour ne rien perdre en cas d'effacement des données Safari ou de changement d'appareil.</div>
+      <button onclick="exportData()">↓ Exporter mes données</button>
+      <textarea id="export-out" rows="4" placeholder="Le JSON exporté apparaîtra ici — copiez-le et gardez-le en lieu sûr (Notes, email, etc.)" style="font-size:11px" readonly></textarea>
+      <div style="height:8px"></div>
+      <textarea id="import-in" rows="4" placeholder="Collez ici un JSON précédemment exporté pour restaurer vos données"></textarea>
+      <button onclick="importData()">↑ Importer (remplace les données actuelles)</button>
+    </div>`;
+}
+window.saveKey = () => { apiKey = document.getElementById('c-key').value.trim(); store.set('apiKey', apiKey); renderConfig(); };
+window.exportData = () => {
+  const payload = { version:1, exportedAt: new Date().toISOString(), transactions, tickerMeta, prices, watchlist };
+  const json = JSON.stringify(payload, null, 2);
+  document.getElementById('export-out').value = json;
+  try {
+    const blob = new Blob([json], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `invest-backup-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+  } catch(e) { /* le téléchargement peut échouer en PWA — le texte ci-dessus reste le filet de secours */ }
+};
+window.importData = () => {
+  const raw = document.getElementById('import-in').value.trim();
+  if (!raw) return;
+  let data;
+  try { data = JSON.parse(raw); } catch(e) { alert('JSON invalide.'); return; }
+  if (!Array.isArray(data.transactions)) { alert('Format non reconnu — ce fichier ne semble pas être une sauvegarde de cet outil.'); return; }
+  if (!confirm('Ceci remplace TOUTES vos données actuelles (transactions, watchlist, prix) par celles du fichier importé. Continuer ?')) return;
+  transactions = data.transactions || [];
+  tickerMeta = data.tickerMeta || {};
+  prices = data.prices || {};
+  watchlist = data.watchlist || [];
+  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices); store.set('watchlist', watchlist);
+  document.getElementById('import-in').value = '';
+  renderPortfolio(); renderWatch(); renderConfig();
+  alert('Import terminé.');
+};
+
+// ---- Tabs ----
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    store.set('lastTab', btn.dataset.tab);
+    ['portfolio','analyse','watch','config'].forEach(t => document.getElementById('tab-'+t).style.display = t===btn.dataset.tab ? 'block':'none');
+  });
+});
+
+renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
+
+const initialTab = store.get('lastTab', 'portfolio');
+document.querySelectorAll('.tab').forEach(b => {
+  const isActive = b.dataset.tab === initialTab;
+  b.classList.toggle('active', isActive);
+  document.getElementById('tab-'+b.dataset.tab).style.display = isActive ? 'block' : 'none';
+});
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(()=>{});
+}
+</script>
+</body>
+</html>
