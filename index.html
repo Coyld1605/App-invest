@@ -8,6 +8,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="apple-mobile-web-app-title" content="Investissement" />
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
 <style>
   :root {
     --bg: #f5f5f4; --card: #ffffff; --border: #e5e5e5;
@@ -91,6 +94,86 @@ let apiKey = store.get('apiKey', '');
   }
   store.set('migratedToTx', true);
 })();
+
+// ---- Synchronisation multi-appareils (Firebase, optionnel) ----
+let fbConfig = store.get('fbConfig', null);
+let fbApp = null, fbAuth = null, fbDb = null, cloudUser = null, syncStatus = '';
+let syncTimer = null;
+
+function initFirebase() {
+  if (!fbConfig || fbApp) return;
+  try {
+    fbApp = firebase.initializeApp(fbConfig);
+    fbAuth = firebase.auth();
+    fbDb = firebase.firestore();
+    fbAuth.onAuthStateChanged((user) => {
+      cloudUser = user;
+      if (user) pullFromCloud();
+      renderConfig();
+    });
+  } catch (e) { syncStatus = 'Configuration Firebase invalide : ' + e.message; }
+}
+
+function scheduleSync() {
+  if (!cloudUser) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(pushToCloud, 1500);
+}
+
+async function pushToCloud() {
+  if (!cloudUser || !fbDb) return;
+  syncStatus = 'Synchronisation…'; renderConfig();
+  try {
+    await fbDb.collection('users').doc(cloudUser.uid).set({
+      transactions, tickerMeta, prices, watchlist, valueHistory,
+      updatedAt: new Date().toISOString(),
+    });
+    syncStatus = 'Synchronisé à ' + new Date().toLocaleTimeString('fr-FR');
+  } catch (e) { syncStatus = 'Échec de synchronisation : ' + e.message; }
+  renderConfig();
+}
+
+async function pullFromCloud() {
+  if (!cloudUser || !fbDb) return;
+  syncStatus = 'Récupération des données…'; renderConfig();
+  try {
+    const doc = await fbDb.collection('users').doc(cloudUser.uid).get();
+    if (doc.exists) {
+      const d = doc.data();
+      transactions = d.transactions || []; tickerMeta = d.tickerMeta || {}; prices = d.prices || {};
+      watchlist = d.watchlist || []; valueHistory = d.valueHistory || [];
+      store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices);
+      store.set('watchlist', watchlist); store.set('valueHistory', valueHistory);
+      renderPortfolio(); renderWatch();
+      syncStatus = 'Données récupérées depuis le cloud.';
+    } else {
+      syncStatus = 'Aucune donnée cloud existante — vos données locales vont être envoyées.';
+      pushToCloud();
+    }
+  } catch (e) { syncStatus = 'Échec de récupération : ' + e.message; }
+  renderConfig();
+}
+
+window.saveFbConfig = () => {
+  const raw = document.getElementById('fb-config').value.trim();
+  try {
+    fbConfig = JSON.parse(raw.replace(/(\w+):/g, '"$1":').replace(/'/g,'"'));
+    store.set('fbConfig', fbConfig);
+    initFirebase();
+    renderConfig();
+  } catch (e) { alert('Configuration Firebase illisible — collez exactement l\'objet firebaseConfig fourni par Firebase.'); }
+};
+window.cloudSignUp = () => {
+  const email = document.getElementById('fb-email').value.trim(), pass = document.getElementById('fb-pass').value;
+  if (!fbAuth) return;
+  fbAuth.createUserWithEmailAndPassword(email, pass).catch(e => { syncStatus = e.message; renderConfig(); });
+};
+window.cloudSignIn = () => {
+  const email = document.getElementById('fb-email').value.trim(), pass = document.getElementById('fb-pass').value;
+  if (!fbAuth) return;
+  fbAuth.signInWithEmailAndPassword(email, pass).catch(e => { syncStatus = e.message; renderConfig(); });
+};
+window.cloudSignOut = () => { if (fbAuth) fbAuth.signOut(); };
 
 const fmt = (n, d=2) => Number.isFinite(n) ? n.toLocaleString('fr-FR', {minimumFractionDigits:d, maximumFractionDigits:d}) : '—';
 
@@ -443,20 +526,20 @@ window.addTransaction = () => {
   }
   transactions.push({ id: Date.now(), ticker:t, type, qty, price, date });
   if (!tickerMeta[t]) tickerMeta[t] = { currency: cur };
-  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta);
+  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); scheduleSync();
   document.getElementById('p-ticker').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
   renderPortfolio();
 };
 window.removeTransaction = (id) => {
   if (!confirm('Supprimer cette transaction ? Le PRU et le P&L seront recalculés.')) return;
-  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); renderPortfolio();
+  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); scheduleSync(); renderPortfolio();
 };
 window.removeTicker = (t) => {
   if (!confirm(`Supprimer TOUTES les transactions ${t} ?`)) return;
-  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); renderPortfolio();
+  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); scheduleSync(); renderPortfolio();
 };
-window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); renderPortfolio(); };
-window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); renderPortfolio(); };
+window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); scheduleSync(); renderPortfolio(); };
+window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); scheduleSync(); renderPortfolio(); };
 window.refreshPrices = async () => {
   if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
   renderPortfolio('loading');
@@ -489,6 +572,7 @@ window.refreshPrices = async () => {
   }
   store.set('prices', prices);
   snapshotValue();
+  scheduleSync();
   renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.');
 };
 
@@ -597,12 +681,12 @@ window.addWatch = () => {
   const t = document.getElementById('w-ticker').value, th = document.getElementById('w-theme').value, n = document.getElementById('w-note').value;
   if (!t) return;
   watchlist.push({id:Date.now(), ticker:t.toUpperCase(), theme: th||'Non classé', note:n});
-  store.set('watchlist', watchlist); renderWatch();
+  store.set('watchlist', watchlist); scheduleSync(); renderWatch();
 };
 window.removeWatch = (id) => {
   const w = watchlist.find(x=>x.id===id);
   if (!confirm(`Retirer ${w ? w.ticker : 'cet élément'} de la watchlist ?`)) return;
-  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); renderWatch();
+  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); scheduleSync(); renderWatch();
 };
 
 // ---- Config ----
@@ -622,8 +706,28 @@ function renderConfig() {
       <button onclick="if(confirm('Vider le cache ? Les prochaines actions referont des appels API frais.')){clearCache();renderConfig();}">Vider le cache</button>
     </div>
     <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Synchronisation multi-appareils</div>
+      ${!fbConfig ? `
+        <div class="muted-text" style="margin-bottom:8px">Collez ici l'objet <code>firebaseConfig</code> copié depuis la console Firebase (Paramètres du projet → Vos applications).</div>
+        <textarea id="fb-config" rows="4" placeholder='{"apiKey":"...", "authDomain":"...", "projectId":"...", ...}'></textarea>
+        <button onclick="saveFbConfig()">Enregistrer la configuration</button>
+      ` : !cloudUser ? `
+        <div class="muted-text" style="margin-bottom:8px">Connectez-vous (même compte sur tous vos appareils pour partager les données).</div>
+        <input id="fb-email" placeholder="Email" type="email"/>
+        <input id="fb-pass" placeholder="Mot de passe" type="password"/>
+        <div class="grid2">
+          <button onclick="cloudSignIn()">Se connecter</button>
+          <button onclick="cloudSignUp()">Créer un compte</button>
+        </div>
+      ` : `
+        <div class="muted-text" style="margin-bottom:8px">Connecté : ${cloudUser.email}</div>
+        <button onclick="cloudSignOut()">Se déconnecter</button>
+      `}
+      ${syncStatus ? `<div class="muted-text" style="margin-top:8px">${syncStatus}</div>` : ''}
+    </div>
+    <div class="card">
       <div style="font-weight:600;margin-bottom:8px">Sauvegarde (export / import)</div>
-      <div class="muted-text" style="margin-bottom:8px">Vos données (transactions, watchlist, prix) ne vivent que sur ce téléphone. Exportez-les régulièrement pour ne rien perdre en cas d'effacement des données Safari ou de changement d'appareil.</div>
+      <div class="muted-text" style="margin-bottom:8px">${cloudUser ? 'Vos données sont synchronisées automatiquement. Gardez tout de même un export ponctuel en filet de secours.' : 'Vos données ne vivent que sur cet appareil (ou sont synchronisées si activé ci-dessus). Exportez-les régulièrement pour ne rien perdre.'}</div>
       <button onclick="exportData()">↓ Exporter mes données</button>
       <textarea id="export-out" rows="4" placeholder="Le JSON exporté apparaîtra ici — copiez-le et gardez-le en lieu sûr (Notes, email, etc.)" style="font-size:11px" readonly></textarea>
       <div style="height:8px"></div>
@@ -656,6 +760,7 @@ window.importData = () => {
   prices = data.prices || {};
   watchlist = data.watchlist || [];
   store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices); store.set('watchlist', watchlist);
+  scheduleSync();
   document.getElementById('import-in').value = '';
   renderPortfolio(); renderWatch(); renderConfig();
   alert('Import terminé.');
@@ -672,6 +777,7 @@ document.querySelectorAll('.tab').forEach(btn => {
 });
 
 renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
+initFirebase();
 
 const initialTab = store.get('lastTab', 'portfolio');
 document.querySelectorAll('.tab').forEach(b => {
