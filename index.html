@@ -157,11 +157,13 @@ async function pullFromCloud() {
 window.saveFbConfig = () => {
   const raw = document.getElementById('fb-config').value.trim();
   try {
-    fbConfig = JSON.parse(raw.replace(/(\w+):/g, '"$1":').replace(/'/g,'"'));
+    const parsed = Function('"use strict"; return (' + raw + ')')();
+    if (!parsed || !parsed.apiKey || !parsed.projectId) throw new Error('champs manquants');
+    fbConfig = parsed;
     store.set('fbConfig', fbConfig);
     initFirebase();
     renderConfig();
-  } catch (e) { alert('Configuration Firebase illisible — collez exactement l\'objet firebaseConfig fourni par Firebase.'); }
+  } catch (e) { alert('Configuration Firebase illisible — collez exactement l\'objet firebaseConfig (avec ses accolades) fourni par Firebase.'); }
 };
 window.cloudSignUp = () => {
   const email = document.getElementById('fb-email').value.trim(), pass = document.getElementById('fb-pass').value;
