@@ -1,4 +1,4 @@
-const CACHE = "invest-v2";
+const CACHE = "invest-v3";
 self.addEventListener("install", (e) => {
   self.skipWaiting();
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["./", "./index.html", "./manifest.json"])));

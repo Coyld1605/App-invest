@@ -15,7 +15,7 @@
   :root {
     --bg: #f5f5f4; --card: #ffffff; --border: #e5e5e5;
     --text: #111111; --text-2: #666666; --accent: #378ADD;
-    --green: #0f6e56; --red: #a32d2d;
+    --green: #0f6e56; --red: #a32d2d; --amber: #a05a00; --purple: #6457a6;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #1c1c1a; --card: #262624; --border: #3a3a38; --text: #f0f0ee; --text-2: #a0a09a; }
@@ -28,6 +28,8 @@
   .tab.active { background:var(--card); color:var(--text); font-weight:600; }
   .card { background:var(--card); border:0.5px solid var(--border); border-radius:12px; padding:1rem 1.1rem; margin-bottom:12px; }
   .card.muted { background:var(--bg); }
+  .hero { background:linear-gradient(135deg, #15243d, #224d70); color:#fff; border:0; padding:1.25rem; }
+  .hero .muted-text { color:#d6e6f5; }
   input, textarea, button { width:100%; font-size:14px; padding:8px 10px; border-radius:8px; border:0.5px solid var(--border); background:var(--bg); color:var(--text); margin-bottom:8px; font-family:inherit; }
   button { cursor:pointer; font-weight:600; background:var(--card); }
   button:active { transform:scale(0.98); }
@@ -39,6 +41,17 @@
   .bar-bg { height:6px; background:var(--bg); border-radius:3px; margin-top:4px; }
   .bar-fill { height:6px; background:var(--accent); border-radius:3px; }
   .del { border:none; background:none; color:var(--red); font-size:18px; padding:0; width:auto; }
+  .pill { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:999px; font-size:11px; font-weight:700; }
+  .pill.buy { color:var(--green); background:#e5f4ed; } .pill.hold { color:#1e5d91; background:#e8f2fb; }
+  .pill.watch { color:var(--amber); background:#fff0d6; } .pill.sell { color:var(--red); background:#fbe9e9; }
+  .signal { padding:10px 0; border-bottom:0.5px solid var(--border); } .signal:last-child { border:0; padding-bottom:0; }
+  .signal-title { font-size:14px; font-weight:700; }
+  .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .stat { padding:10px 8px; border-radius:10px; background:var(--bg); }
+  .stat strong { display:block; font-size:16px; margin-top:2px; }
+  .action { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .allocation { height:9px; border-radius:8px; overflow:hidden; display:flex; background:var(--bg); margin-top:7px; }
+  .allocation > span { height:100%; min-width:2px; }
   h2 { display:none; }
 </style>
 </head>
@@ -46,12 +59,14 @@
 <div class="wrap">
   <h2 id="sr-title">Outil d'aide à l'investissement : portfolio, analyse d'action et watchlist</h2>
   <div class="tabs">
+    <button class="tab" data-tab="assistant">Assistant</button>
     <button class="tab" data-tab="portfolio">Portfolio</button>
     <button class="tab" data-tab="analyse">Analyse</button>
     <button class="tab" data-tab="watch">Watchlist</button>
     <button class="tab" data-tab="config">Config</button>
   </div>
 
+  <div id="tab-assistant"></div>
   <div id="tab-portfolio"></div>
   <div id="tab-analyse" style="display:none"></div>
   <div id="tab-watch" style="display:none"></div>
@@ -79,6 +94,7 @@ let tickerMeta = store.get('tickerMeta', {});
 let prices = store.get('prices', {});
 let watchlist = store.get('watchlist', []);
 let apiKey = store.get('apiKey', '');
+let investorProfile = store.get('investorProfile', { risk: 'Équilibré', horizon: '5 ans', cash: 0 });
 
 // Migration ponctuelle depuis l'ancien modèle "positions" (une ligne = une position)
 (function migrate() {
@@ -125,7 +141,7 @@ async function pushToCloud() {
   syncStatus = 'Synchronisation…'; renderConfig();
   try {
     await fbDb.collection('users').doc(cloudUser.uid).set({
-      transactions, tickerMeta, prices, watchlist, valueHistory,
+      transactions, tickerMeta, prices, watchlist, valueHistory, investorProfile,
       updatedAt: new Date().toISOString(),
     });
     syncStatus = 'Synchronisé à ' + new Date().toLocaleTimeString('fr-FR');
@@ -141,10 +157,10 @@ async function pullFromCloud() {
     if (doc.exists) {
       const d = doc.data();
       transactions = d.transactions || []; tickerMeta = d.tickerMeta || {}; prices = d.prices || {};
-      watchlist = d.watchlist || []; valueHistory = d.valueHistory || [];
+      watchlist = d.watchlist || []; valueHistory = d.valueHistory || []; investorProfile = d.investorProfile || investorProfile;
       store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices);
-      store.set('watchlist', watchlist); store.set('valueHistory', valueHistory);
-      renderPortfolio(); renderWatch();
+      store.set('watchlist', watchlist); store.set('valueHistory', valueHistory); store.set('investorProfile', investorProfile);
+      renderPortfolio(); renderWatch(); renderAssistant();
       syncStatus = 'Données récupérées depuis le cloud.';
     } else {
       syncStatus = 'Aucune donnée cloud existante — vos données locales vont être envoyées.';
@@ -313,6 +329,70 @@ async function fetchSeries(symbol) {
   return result;
 }
 
+// ---- Assistant de décision ----
+function scoreTone(score) {
+  if (score >= 65) return { label:'Renforcer', cls:'buy' };
+  if (score >= 50) return { label:'Conserver', cls:'hold' };
+  if (score >= 40) return { label:'Surveiller', cls:'watch' };
+  return { label:'Réévaluer', cls:'sell' };
+}
+function decisionFor(ticker, agg) {
+  const price = prices[ticker] ?? agg.pru;
+  const perf = agg.pru ? (price - agg.pru) / agg.pru * 100 : 0;
+  const plan = tickerMeta[ticker] || {};
+  const score = tickerScores[ticker]?.total;
+  const stop = parseFloat(plan.stop), target = parseFloat(plan.target);
+  if (Number.isFinite(stop) && price <= stop) return { ticker, kind:'Réduire / protéger', cls:'sell', priority:1, text:`Cours ${fmt(price)} sous votre seuil de protection (${fmt(stop)}). Vérifiez votre scénario avant la prochaine séance.`, score, perf };
+  if (Number.isFinite(target) && price >= target) return { ticker, kind:'Objectif atteint', cls:'buy', priority:2, text:`Cours ${fmt(price)} au-dessus de votre objectif (${fmt(target)}). Envisagez de sécuriser une partie des gains.`, score, perf };
+  if (score !== undefined && score < 40 && perf < -8) return { ticker, kind:'Réévaluer', cls:'sell', priority:1, text:`Score faible (${score}/100) et position à ${fmt(perf,1)}%. Revoyez la thèse, le risque et votre seuil de sortie.`, score, perf };
+  if (score !== undefined && score < 40) return { ticker, kind:'Surveiller', cls:'watch', priority:2, text:`Le momentum et/ou la tendance sont fragiles (score ${score}/100). Pas de renforcement avant amélioration.`, score, perf };
+  if (score !== undefined && score >= 65 && perf < 5) return { ticker, kind:'Renforcement possible', cls:'buy', priority:3, text:`Signal technique constructif (${score}/100) avec une position encore proche de son prix moyen. À calibrer selon votre allocation.`, score, perf };
+  return { ticker, kind: score === undefined ? 'Analyse à lancer' : 'Conserver', cls: score === undefined ? 'watch' : 'hold', priority:3, text: score === undefined ? 'Lancez une analyse pour disposer de signaux de tendance, momentum et volume.' : `Score ${score}/100 · position à ${fmt(perf,1)}%. Continuez à suivre votre scénario d’investissement.`, score, perf };
+}
+function renderAssistant() {
+  const el = document.getElementById('tab-assistant');
+  if (!el) return;
+  const { tickers, aggs, totalValue, totalCostBasis } = computeTotals();
+  const decisions = tickers.map(t => decisionFor(t, aggs[t])).sort((a,b)=>a.priority-b.priority);
+  const scoredWatch = watchlist.map(w => ({ ...w, score:tickerScores[w.ticker]?.total })).filter(w => w.score !== undefined).sort((a,b)=>b.score-a.score);
+  const candidates = scoredWatch.filter(w=>w.score>=60).slice(0,3);
+  const largest = tickers.map(t => ({ ticker:t, value:aggs[t].qty*(prices[t]??aggs[t].pru)*rateFor(t) })).sort((a,b)=>b.value-a.value)[0];
+  const concentration = largest && totalValue ? largest.value/totalValue*100 : 0;
+  const pnl = totalValue-totalCostBasis;
+  const analysisCount = tickers.filter(t => tickerScores[t]?.total !== undefined).length;
+  const colors=['#378add','#6457a6','#0f6e56','#c77c02','#a32d2d','#777'];
+  el.innerHTML = `
+    <div class="card hero">
+      <div class="row"><div><div class="muted-text">VOTRE CO-PILOTE D’INVESTISSEMENT</div><div style="font-size:22px;font-weight:750;margin-top:3px">Aujourd’hui, priorisez l’essentiel.</div></div><div style="font-size:25px">◈</div></div>
+      <div class="stat-grid" style="margin-top:16px">
+        <div class="stat"><span class="muted-text">Portefeuille</span><strong>${fmt(totalValue)} €</strong></div>
+        <div class="stat"><span class="muted-text">P&L latent</span><strong class="${pnl>=0?'green':'red'}">${pnl>=0?'+':''}${fmt(pnl)} €</strong></div>
+        <div class="stat"><span class="muted-text">Profil</span><strong>${investorProfile.risk}</strong></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row"><div style="font-weight:700">Point d’attention</div><span class="muted-text">${analysisCount}/${tickers.length} analysée(s)</span></div>
+      ${!tickers.length ? `<div class="muted-text" style="padding:12px 0 2px">Ajoutez votre première transaction pour obtenir des recommandations liées à vos positions.</div>` : decisions.slice(0,4).map(d => `<div class="signal"><div class="row" style="align-items:start;gap:8px"><div><div class="signal-title">${d.ticker} · ${d.kind}</div><div class="muted-text" style="margin-top:3px;line-height:1.4">${d.text}</div></div><span class="pill ${d.cls}">${d.score===undefined?'À analyser':d.score+'/100'}</span></div></div>`).join('')}
+      ${tickers.length ? `<button class="action" style="margin:12px 0 0" onclick="scanAssistant()" ${!apiKey?'disabled':''}>${apiKey?'✦ Actualiser mes signaux':'Ajoutez une clé API pour activer les signaux'}</button>` : ''}
+    </div>
+    ${tickers.length ? `<div class="card">
+      <div class="row"><div style="font-weight:700">Répartition et risque</div><span class="pill ${concentration>35?'watch':'hold'}">${concentration>35?'Concentration à surveiller':'Diversification'}</span></div>
+      <div class="allocation">${tickers.map((t,i)=>`<span style="width:${totalValue ? aggs[t].qty*(prices[t]??aggs[t].pru)*rateFor(t)/totalValue*100 : 0}%;background:${colors[i%colors.length]}"></span>`).join('')}</div>
+      <div class="muted-text" style="margin-top:7px;line-height:1.5">${largest ? `${largest.ticker} représente ${fmt(concentration,0)}% de votre portefeuille.` : ''} ${concentration>35 ? 'Une position très dominante mérite une limite de risque explicite.' : 'Aucune ligne ne domine fortement la valeur suivie.'}</div>
+      <div class="muted-text" style="margin-top:8px">Horizon : ${investorProfile.horizon} · Liquidités déclarées : ${fmt(parseFloat(investorProfile.cash)||0)} €</div>
+    </div>` : ''}
+    <div class="card">
+      <div class="row"><div style="font-weight:700">Opportunités à étudier</div><span class="muted-text">Watchlist</span></div>
+      ${candidates.length ? candidates.map(w=>`<div class="signal"><div class="row"><div><div class="signal-title">${w.ticker} <span class="pill buy">${w.score}/100</span></div><div class="muted-text" style="margin-top:3px">${w.theme}${w.note?' · '+w.note:''}</div></div><span class="muted-text">À approfondir</span></div></div>`).join('') : `<div class="muted-text" style="padding:10px 0 2px">Analysez les titres de votre watchlist : les scores ≥ 60 apparaîtront ici comme pistes à approfondir.</div>`}
+    </div>
+    <div class="muted-text" style="font-size:11px;line-height:1.45;padding:0 4px 10px">Les signaux combinent les données de marché et vos règles personnelles. Ils ne constituent ni une recommandation personnalisée, ni une garantie de performance.</div>`;
+}
+window.scanAssistant = async () => {
+  const universe = [...new Set([...allTickers(), ...watchlist.map(w=>w.ticker)])];
+  if (!universe.length || !apiKey) return;
+  for (const ticker of universe) await calcTickerScore(ticker);
+};
+
 // ---- Portfolio ----
 let usdEurRate = store.get('usdEurRate', null);
 function rateFor(ticker) { return (tickerMeta[ticker]?.currency === 'USD' && usdEurRate) ? usdEurRate : 1; }
@@ -411,8 +491,8 @@ let scoreLoading = {};
 let benchmarkCache = null;
 
 async function calcTickerScore(t) {
-  if (!apiKey) { tickerScores[t] = { error: "Ajoutez d'abord une clé API dans l'onglet dédié." }; renderPortfolio(); renderWatch(); return; }
-  scoreLoading[t] = true; renderPortfolio(); renderWatch();
+  if (!apiKey) { tickerScores[t] = { error: "Ajoutez d'abord une clé API dans l'onglet dédié." }; renderPortfolio(); renderWatch(); renderAssistant(); return; }
+  scoreLoading[t] = true; renderPortfolio(); renderWatch(); renderAssistant();
   try {
     const seriesWasCached = !!cacheGet('series_'+t, TTL.series);
     const series = await fetchSeries(t);
@@ -428,10 +508,11 @@ async function calcTickerScore(t) {
     tickerScores[t] = { error: e.message };
   }
   scoreLoading[t] = false;
-  renderPortfolio(); renderWatch();
+  renderPortfolio(); renderWatch(); renderAssistant();
 }
 window.calcTickerScore = calcTickerScore;
 window.setTickerPer = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), per: val }; store.set('tickerMeta', tickerMeta); };
+window.setTickerPlan = (t, field, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), [field]: val }; store.set('tickerMeta', tickerMeta); scheduleSync(); renderAssistant(); };
 
 function renderPortfolio(status) {
   const el = document.getElementById('tab-portfolio');
@@ -488,6 +569,8 @@ function renderPortfolio(status) {
                <span style="font-weight:700;font-size:18px;color:${tickerScores[t].total>=60?'#0f6e56':tickerScores[t].total>=40?'#b8860b':'#a32d2d'}">${tickerScores[t].total}/100</span>
              </div>`) : ''}
         <button style="margin-top:8px" onclick="toggleTicker('${t}')">${isOpen?'▲ Masquer les transactions':'▼ Voir les transactions ('+txForTicker(t).length+')'}</button>
+        ${isOpen ? `<div class="grid2" style="margin-top:8px"><input placeholder="Seuil de protection" value="${tickerMeta[t]?.stop||''}" onchange="setTickerPlan('${t}','stop',this.value)"/><input placeholder="Objectif de cours" value="${tickerMeta[t]?.target||''}" onchange="setTickerPlan('${t}','target',this.value)"/></div>
+          <input placeholder="Votre thèse / condition de vente" value="${tickerMeta[t]?.thesis||''}" onchange="setTickerPlan('${t}','thesis',this.value)"/>` : ''}
         ${isOpen ? txForTicker(t).map(tx => `
           <div class="row" style="font-size:12px;padding:4px 0;border-top:0.5px solid var(--border)">
             <span>${tx.date} · ${tx.type==='buy'?'Achat':'Vente'} ${fmt(tx.qty,4)} @ ${fmt(tx.price)} ${sym}</span>
@@ -530,18 +613,18 @@ window.addTransaction = () => {
   if (!tickerMeta[t]) tickerMeta[t] = { currency: cur };
   store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); scheduleSync();
   document.getElementById('p-ticker').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
-  renderPortfolio();
+  renderPortfolio(); renderAssistant();
 };
 window.removeTransaction = (id) => {
   if (!confirm('Supprimer cette transaction ? Le PRU et le P&L seront recalculés.')) return;
-  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); scheduleSync(); renderPortfolio();
+  transactions = transactions.filter(t=>t.id!==id); store.set('transactions', transactions); scheduleSync(); renderPortfolio(); renderAssistant();
 };
 window.removeTicker = (t) => {
   if (!confirm(`Supprimer TOUTES les transactions ${t} ?`)) return;
-  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); scheduleSync(); renderPortfolio();
+  transactions = transactions.filter(x=>x.ticker!==t); store.set('transactions', transactions); scheduleSync(); renderPortfolio(); renderAssistant();
 };
-window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); scheduleSync(); renderPortfolio(); };
-window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); scheduleSync(); renderPortfolio(); };
+window.updateTickerPrice = (t, val) => { prices[t] = parseFloat(val.replace(',','.')) || prices[t]; store.set('prices', prices); scheduleSync(); renderPortfolio(); renderAssistant(); };
+window.updateTickerCurrency = (t, val) => { tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: val }; store.set('tickerMeta', tickerMeta); scheduleSync(); renderPortfolio(); renderAssistant(); };
 window.refreshPrices = async () => {
   if (!apiKey) { renderPortfolio("Ajoutez d'abord une clé API dans l'onglet dédié."); return; }
   renderPortfolio('loading');
@@ -575,7 +658,7 @@ window.refreshPrices = async () => {
   store.set('prices', prices);
   snapshotValue();
   scheduleSync();
-  renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.');
+  renderPortfolio(failed.length ? `Échec pour : ${failed.join(', ')}` : 'Prix à jour.'); renderAssistant();
 };
 
 // ---- Analyse ----
@@ -683,12 +766,12 @@ window.addWatch = () => {
   const t = document.getElementById('w-ticker').value, th = document.getElementById('w-theme').value, n = document.getElementById('w-note').value;
   if (!t) return;
   watchlist.push({id:Date.now(), ticker:t.toUpperCase(), theme: th||'Non classé', note:n});
-  store.set('watchlist', watchlist); scheduleSync(); renderWatch();
+  store.set('watchlist', watchlist); scheduleSync(); renderWatch(); renderAssistant();
 };
 window.removeWatch = (id) => {
   const w = watchlist.find(x=>x.id===id);
   if (!confirm(`Retirer ${w ? w.ticker : 'cet élément'} de la watchlist ?`)) return;
-  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); scheduleSync(); renderWatch();
+  watchlist = watchlist.filter(w=>w.id!==id); store.set('watchlist', watchlist); scheduleSync(); renderWatch(); renderAssistant();
 };
 
 // ---- Config ----
@@ -696,6 +779,13 @@ function renderConfig() {
   const el = document.getElementById('tab-config');
   const cacheCount = Object.keys(localStorage).filter(k=>k.startsWith('cache_')).length;
   el.innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">Mon cadre d’investissement</div>
+      <div class="muted-text" style="margin-bottom:8px">Ces repères aident l’assistant à contextualiser vos signaux. Ils ne remplacent pas votre propre analyse.</div>
+      <div class="grid2"><select id="i-risk"><option ${investorProfile.risk==='Prudent'?'selected':''}>Prudent</option><option ${investorProfile.risk==='Équilibré'?'selected':''}>Équilibré</option><option ${investorProfile.risk==='Dynamique'?'selected':''}>Dynamique</option></select><select id="i-horizon"><option ${investorProfile.horizon==='1–3 ans'?'selected':''}>1–3 ans</option><option ${investorProfile.horizon==='5 ans'?'selected':''}>5 ans</option><option ${investorProfile.horizon==='10 ans et +'?'selected':''}>10 ans et +</option></select></div>
+      <input id="i-cash" inputmode="decimal" placeholder="Liquidités disponibles (€)" value="${investorProfile.cash||''}"/>
+      <button onclick="saveInvestorProfile()">Enregistrer mon profil</button>
+    </div>
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">Clé API Twelve Data</div>
       <div class="muted-text" style="margin-bottom:8px">Créez un compte gratuit sur twelvedata.com pour obtenir une clé. Plan gratuit : ~8 requêtes/minute. La clé est stockée uniquement sur votre téléphone (localStorage), jamais envoyée ailleurs qu'à Twelve Data.</div>
@@ -738,8 +828,12 @@ function renderConfig() {
     </div>`;
 }
 window.saveKey = () => { apiKey = document.getElementById('c-key').value.trim(); store.set('apiKey', apiKey); renderConfig(); };
+window.saveInvestorProfile = () => {
+  investorProfile = { risk:document.getElementById('i-risk').value, horizon:document.getElementById('i-horizon').value, cash:parseFloat(document.getElementById('i-cash').value.replace(',','.'))||0 };
+  store.set('investorProfile', investorProfile); scheduleSync(); renderConfig(); renderAssistant();
+};
 window.exportData = () => {
-  const payload = { version:1, exportedAt: new Date().toISOString(), transactions, tickerMeta, prices, watchlist };
+  const payload = { version:2, exportedAt: new Date().toISOString(), transactions, tickerMeta, prices, watchlist, investorProfile };
   const json = JSON.stringify(payload, null, 2);
   document.getElementById('export-out').value = json;
   try {
@@ -761,10 +855,11 @@ window.importData = () => {
   tickerMeta = data.tickerMeta || {};
   prices = data.prices || {};
   watchlist = data.watchlist || [];
-  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices); store.set('watchlist', watchlist);
+  investorProfile = data.investorProfile || investorProfile;
+  store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); store.set('prices', prices); store.set('watchlist', watchlist); store.set('investorProfile', investorProfile);
   scheduleSync();
   document.getElementById('import-in').value = '';
-  renderPortfolio(); renderWatch(); renderConfig();
+  renderPortfolio(); renderWatch(); renderAssistant(); renderConfig();
   alert('Import terminé.');
 };
 
@@ -774,14 +869,14 @@ document.querySelectorAll('.tab').forEach(btn => {
     document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     store.set('lastTab', btn.dataset.tab);
-    ['portfolio','analyse','watch','config'].forEach(t => document.getElementById('tab-'+t).style.display = t===btn.dataset.tab ? 'block':'none');
+    ['assistant','portfolio','analyse','watch','config'].forEach(t => document.getElementById('tab-'+t).style.display = t===btn.dataset.tab ? 'block':'none');
   });
 });
 
-renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
+renderAssistant(); renderPortfolio(); renderAnalyse(null,'',false); renderWatch(); renderConfig();
 initFirebase();
 
-const initialTab = store.get('lastTab', 'portfolio');
+const initialTab = store.get('lastTab', 'assistant');
 document.querySelectorAll('.tab').forEach(b => {
   const isActive = b.dataset.tab === initialTab;
   b.classList.toggle('active', isActive);
