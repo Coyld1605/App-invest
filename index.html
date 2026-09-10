@@ -329,6 +329,25 @@ async function fetchSeries(symbol) {
   return result;
 }
 
+async function fetchPriceOnDate(symbol, dateStr) {
+  const key = 'histprice_'+symbol+'_'+dateStr;
+  const cached = cacheGet(key, Infinity); // historique immuable : cache permanent
+  if (cached) return cached;
+  const startDate = new Date(dateStr); startDate.setDate(startDate.getDate()-7);
+  const start = startDate.toISOString().slice(0,10);
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&start_date=${start}&end_date=${dateStr}&apikey=${apiKey}`);
+  const data = await res.json();
+  if (data.status === 'error' || data.code) throw new Error(data.message || 'Erreur API');
+  if (!data.values || !data.values.length) throw new Error(`Aucun cours trouvé pour ${symbol} autour du ${dateStr} (marché fermé ou ticker invalide).`);
+  const result = {
+    price: parseFloat(data.values[0].close),
+    actualDate: data.values[0].datetime,
+    currency: data.meta && data.meta.currency ? data.meta.currency : null,
+  };
+  cacheSet(key, result);
+  return result;
+}
+
 // ---- Assistant de décision ----
 function scoreTone(score) {
   if (score >= 65) return { label:'Renforcer', cls:'buy' };
@@ -583,37 +602,64 @@ function renderPortfolio(status) {
       <div class="grid2">
         <input id="p-ticker" list="ticker-suggestions" placeholder="Ticker"/>
         <select id="p-type"><option value="buy">Achat</option><option value="sell">Vente</option></select>
-        <input id="p-qty" placeholder="Quantité"/>
-        <input id="p-price" placeholder="Prix"/>
       </div>
       <input id="p-date" type="date" value="${new Date().toISOString().slice(0,10)}"/>
-      <select id="p-currency">
-        <option value="EUR">EUR</option>
-        <option value="USD">USD</option>
-      </select>
-      <button onclick="addTransaction()">+ Ajouter la transaction</button>
+      <div class="grid2">
+        <input id="p-amount" placeholder="Montant investi (€/$)" inputmode="decimal"/>
+        <input id="p-qty" placeholder="ou quantité" inputmode="decimal"/>
+      </div>
+      <div class="muted-text" style="margin-bottom:8px">Renseignez l'un des deux — le cours à cette date et le reste sont calculés automatiquement.</div>
+      <input id="p-price" placeholder="Prix (optionnel — sinon récupéré automatiquement)" inputmode="decimal"/>
+      <button id="p-submit" onclick="addTransaction()">+ Ajouter la transaction</button>
     </div>`;
   attachAutocomplete(['p-ticker']);
 }
 window.toggleTicker = (t) => { expandedTicker = expandedTicker===t ? null : t; renderPortfolio(); };
-window.addTransaction = () => {
+window.addTransaction = async () => {
   const t = document.getElementById('p-ticker').value.trim().toUpperCase();
   const type = document.getElementById('p-type').value;
-  const q = document.getElementById('p-qty').value;
-  const pr = document.getElementById('p-price').value;
   const date = document.getElementById('p-date').value;
-  const cur = document.getElementById('p-currency').value;
-  if (!t||!q||!pr||!date) return;
-  const qty = parseFloat(q.replace(',','.')), price = parseFloat(pr.replace(',','.'));
+  const amountInput = document.getElementById('p-amount').value.trim();
+  const qtyInput = document.getElementById('p-qty').value.trim();
+  const priceInput = document.getElementById('p-price').value.trim();
+  if (!t || !date) { alert('Ticker et date obligatoires.'); return; }
+  if (!amountInput && !qtyInput) { alert('Renseignez au moins le montant investi ou la quantité.'); return; }
+
+  const btn = document.getElementById('p-submit');
+  let price, currency, actualDate = null;
+  const manualPrice = priceInput ? parseFloat(priceInput.replace(',','.')) : null;
+
+  if (manualPrice) {
+    price = manualPrice;
+    currency = tickerMeta[t]?.currency || null;
+  } else {
+    if (!apiKey) { alert("Ajoutez une clé API (onglet Config) pour récupérer automatiquement le cours, ou renseignez le prix manuellement."); return; }
+    btn.disabled = true; btn.textContent = 'Récupération du cours…';
+    try {
+      const hist = await fetchPriceOnDate(t, date);
+      price = hist.price; actualDate = hist.actualDate;
+      currency = tickerMeta[t]?.currency || hist.currency || 'EUR';
+    } catch (e) {
+      alert(e.message); btn.disabled = false; btn.textContent = '+ Ajouter la transaction'; return;
+    }
+    btn.disabled = false; btn.textContent = '+ Ajouter la transaction';
+  }
+
+  let qty, amount;
+  if (qtyInput) { qty = parseFloat(qtyInput.replace(',','.')); amount = qty*price; }
+  else { amount = parseFloat(amountInput.replace(',','.')); qty = amount/price; }
+
   if (type==='sell') {
     const agg = computeAgg(t);
     if (qty > agg.qty + 1e-9) { alert(`Vous ne détenez que ${fmt(agg.qty,4)} ${t}, impossible de vendre ${fmt(qty,4)}.`); return; }
   }
   transactions.push({ id: Date.now(), ticker:t, type, qty, price, date });
-  if (!tickerMeta[t]) tickerMeta[t] = { currency: cur };
+  if (!tickerMeta[t]) tickerMeta[t] = { currency: currency || 'EUR' };
   store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); scheduleSync();
-  document.getElementById('p-ticker').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
+  document.getElementById('p-ticker').value=''; document.getElementById('p-amount').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
   renderPortfolio(); renderAssistant();
+  const sym = (tickerMeta[t]?.currency)==='USD' ? '$' : '€';
+  alert(`${type==='buy'?'Achat':'Vente'} enregistré : ${fmt(qty,4)} action(s) à ${fmt(price)} ${sym}${actualDate && actualDate!==date ? ` (cours du ${actualDate}, marché fermé le ${date})` : ''}.`);
 };
 window.removeTransaction = (id) => {
   if (!confirm('Supprimer cette transaction ? Le PRU et le P&L seront recalculés.')) return;
