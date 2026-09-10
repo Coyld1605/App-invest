@@ -610,6 +610,11 @@ function renderPortfolio(status) {
       </div>
       <div class="muted-text" style="margin-bottom:8px">Renseignez l'un des deux — le cours à cette date et le reste sont calculés automatiquement.</div>
       <input id="p-price" placeholder="Prix (optionnel — sinon récupéré automatiquement)" inputmode="decimal"/>
+      <select id="p-currency">
+        <option value="">Devise : auto (détectée)</option>
+        <option value="EUR">Forcer EUR</option>
+        <option value="USD">Forcer USD</option>
+      </select>
       <button id="p-submit" onclick="addTransaction()">+ Ajouter la transaction</button>
     </div>`;
   attachAutocomplete(['p-ticker']);
@@ -622,6 +627,7 @@ window.addTransaction = async () => {
   const amountInput = document.getElementById('p-amount').value.trim();
   const qtyInput = document.getElementById('p-qty').value.trim();
   const priceInput = document.getElementById('p-price').value.trim();
+  const currencyOverride = document.getElementById('p-currency').value;
   if (!t || !date) { alert('Ticker et date obligatoires.'); return; }
   if (!amountInput && !qtyInput) { alert('Renseignez au moins le montant investi ou la quantité.'); return; }
 
@@ -631,14 +637,14 @@ window.addTransaction = async () => {
 
   if (manualPrice) {
     price = manualPrice;
-    currency = tickerMeta[t]?.currency || null;
+    currency = currencyOverride || tickerMeta[t]?.currency || null;
   } else {
     if (!apiKey) { alert("Ajoutez une clé API (onglet Config) pour récupérer automatiquement le cours, ou renseignez le prix manuellement."); return; }
     btn.disabled = true; btn.textContent = 'Récupération du cours…';
     try {
       const hist = await fetchPriceOnDate(t, date);
       price = hist.price; actualDate = hist.actualDate;
-      currency = tickerMeta[t]?.currency || hist.currency || 'EUR';
+      currency = currencyOverride || tickerMeta[t]?.currency || hist.currency || 'EUR';
     } catch (e) {
       alert(e.message); btn.disabled = false; btn.textContent = '+ Ajouter la transaction'; return;
     }
@@ -654,9 +660,9 @@ window.addTransaction = async () => {
     if (qty > agg.qty + 1e-9) { alert(`Vous ne détenez que ${fmt(agg.qty,4)} ${t}, impossible de vendre ${fmt(qty,4)}.`); return; }
   }
   transactions.push({ id: Date.now(), ticker:t, type, qty, price, date });
-  if (!tickerMeta[t]) tickerMeta[t] = { currency: currency || 'EUR' };
+  if (!tickerMeta[t] || currencyOverride) tickerMeta[t] = { ...(tickerMeta[t]||{}), currency: currency || 'EUR' };
   store.set('transactions', transactions); store.set('tickerMeta', tickerMeta); scheduleSync();
-  document.getElementById('p-ticker').value=''; document.getElementById('p-amount').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value='';
+  document.getElementById('p-ticker').value=''; document.getElementById('p-amount').value=''; document.getElementById('p-qty').value=''; document.getElementById('p-price').value=''; document.getElementById('p-currency').value='';
   renderPortfolio(); renderAssistant();
   const sym = (tickerMeta[t]?.currency)==='USD' ? '$' : '€';
   alert(`${type==='buy'?'Achat':'Vente'} enregistré : ${fmt(qty,4)} action(s) à ${fmt(price)} ${sym}${actualDate && actualDate!==date ? ` (cours du ${actualDate}, marché fermé le ${date})` : ''}.`);
